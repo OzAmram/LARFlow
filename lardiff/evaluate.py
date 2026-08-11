@@ -71,6 +71,45 @@ def plot_hist(
     plt.close()
 
 
+def plot_energy_profile(
+    gen_hits: dict[str, np.ndarray],
+    g4_hits: dict[str, np.ndarray],
+    n_events: int,
+    axis: str,
+    path: str,
+    per: str = "event",
+    bins: int = 80,
+):
+    """Average deposited energy vs. a coordinate.
+
+    per="event": mean energy deposited per event in each coordinate bin
+    per="hit":   mean energy of a single hit in each coordinate bin
+    """
+    combined = np.concatenate([gen_hits[axis], g4_hits[axis]])
+    edges = np.linspace(combined.min(), combined.max(), bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    plt.figure(figsize=(6, 4.5))
+    for hits, label in [(g4_hits, "Geant4"), (gen_hits, "Model")]:
+        e_sum, _ = np.histogram(hits[axis], bins=edges, weights=hits["edep"])
+        if per == "event":
+            profile = e_sum / n_events
+        else:
+            counts, _ = np.histogram(hits[axis], bins=edges)
+            profile = np.divide(
+                e_sum, counts, out=np.full(bins, np.nan), where=counts > 0
+            )
+        plt.step(centers, profile, where="mid", label=label)
+    plt.yscale("log")
+    plt.xlabel(f"hit {axis} [mm]")
+    if per == "event":
+        plt.ylabel("mean deposited energy per event [MeV / bin]")
+    else:
+        plt.ylabel("mean hit energy [MeV]")
+    plt.legend()
+    plt.savefig(path, bbox_inches="tight")
+    plt.close()
+
+
 def plot_response_profile(
     e_inc: np.ndarray,
     ratio_gen: np.ndarray,
@@ -184,6 +223,10 @@ def main(args: list[str] | None = None) -> None:
     for name in ["x", "y", "z"]:
         plot_hist(gen_hits[name], g4_hits[name], f"hit {name} [mm]",
                   path(f"hit_{name}.pdf"))
+        plot_energy_profile(gen_hits, g4_hits, len(gen_points), name,
+                            path(f"energy_profile_{name}.pdf"), per="event")
+        plot_energy_profile(gen_hits, g4_hits, len(gen_points), name,
+                            path(f"mean_hit_energy_{name}.pdf"), per="hit")
         plot_hist(gen_obs[f"extent_{name}"], g4_obs[f"extent_{name}"],
                   f"event {name} extent [mm]", path(f"extent_{name}.pdf"))
         plot_hist(gen_obs[f"centroid_{name}"], g4_obs[f"centroid_{name}"],
