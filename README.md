@@ -12,7 +12,9 @@ conditioned on the incident particle energy and the number of hits, and
 generates events by integrating the learned ODE from Gaussian noise.
 
 v1 targets negative muons (PDG 13) only and builds the complete pipeline:
-preprocessing, training, generation, and validation plots.
+preprocessing, training, generation, and validation plots. v2 adds an
+independently trained electron (PDG 11) model using the same code and an
+8192-point cache; the two are separate runs, not a joint multi-particle model.
 
 ## Relation to AllShowers
 
@@ -47,6 +49,7 @@ schedulers, loss bookkeeping) is inherited unchanged from AllShowers.
 
 ```
 conf/lar_muon.yaml            # production config (full cache, 4096 points)
+conf/lar_electron.yaml        # electron config (8192 points, batch 64, 40 epochs)
 conf/lar_muon_mini.yaml       # small config for smoke tests
 scripts/preprocess_lar.py     # raw voxel file -> per-particle padded cache
 scripts/train_perlmutter.sh   # single-GPU sbatch script (NERSC Perlmutter)
@@ -134,6 +137,56 @@ distribution (KS p = 0.90) with unchanged physics observables. Known
 imperfection: mean transverse (x/y) extents are ~5% low — a tail effect; the
 medians agree.
 
+## v2 results (electrons, 40 epochs, same ~1.3M-parameter architecture)
+
+`conf/lar_electron.yaml`: cap 8192 points (5.8% of events truncated, ~0.05% of
+mean energy lost), batch 64, 40 epochs — 18 h on one A100, ~27 min/epoch.
+Train 0.2714 / val 0.2706 at the best epoch; validation tracked training
+throughout. The loss is *not* comparable to the muon run's 0.13 (different
+target distribution, ~3x the hits per event, much softer voxel spectrum).
+
+Validation on 2000 held-out events, truth-N:
+
+| observable                | model  | Geant4 |
+|---------------------------|--------|--------|
+| median total edep [MeV]   | 805.5  | 803.1  |
+| median voxel edep [MeV]   | 0.1085 | 0.1085 |
+| response E_dep/E_inc      | 0.9953 ± 0.043 | 0.9964 ± 0.014 |
+| per-event E_total corr.   | 0.9997 | —      |
+| median hit rms about centroid, x / z [mm] | 137.3 / 382.1 | 135.9 / 377.7 |
+
+The voxel energy spectrum agrees to ~1% at every percentile from the 1st
+(0.53 keV) to the 99.9th (9.3 MeV). Per-axis energy profiles agree to 4–7% rms
+in the core bins. Empirical-N generation is nearly indistinguishable from
+truth-N here (per-event energy correlation 0.9997 either way), because P(N|E)
+is narrow for electrons — sampled N lands within 7.5% of the true N for half
+the events. This is unlike muons, where the same swap cost a visible amount of
+correlation (0.999 → 0.995).
+
+Two known imperfections:
+
+- **Response spread is ~3x too wide** (0.043 vs 0.014), consistently across the
+  energy range. Geant4 electrons below ~57 MeV are fully contained and deposit
+  essentially all their energy (spread ≈ 0), and the model does not reproduce
+  how deterministic that containment is. The *mean* response is correct.
+- **Event extents run 3–5% high in the median and further out in the tail**
+  (p90 z-extent 6369 vs 5055 mm). The halo population itself is right — the
+  fraction of hits more than 0.5/1/2 m from the event centroid matches Geant4
+  to about a percent (0.251/0.0489/0.0052 vs 0.248/0.0490/0.0049) — but the
+  slight excess in the >2 m tail is amplified by extent being a min–max
+  statistic. Those hits carry 0.16% of the event energy.
+
+### Generated coordinates are continuous, not voxelized
+
+Worth knowing before using samples downstream, and true of **both** models: the
+training data sits exactly on the 5 mm voxel grid, but the model emits
+continuous coordinates with no learned grid structure — the offset from the
+nearest voxel centre is uniformly distributed (mean 1.250 mm, versus 1.25 for
+pure noise and 0.000 for Geant4). Snapping generated hits back onto the grid
+therefore produces collisions: ~5% of electron hits and ~3% of muon hits land
+on an already-occupied voxel, so a snap step must merge duplicates and sum
+their energies rather than assume uniqueness.
+
 ## torch 2.5 notes
 
 The pinned environment (torch 2.5.1+cu121) has three flex-attention pitfalls
@@ -151,9 +204,18 @@ this repo works around; all disappear with torch ≥ 2.6:
 
 ## Next steps (v2 candidates)
 
-- Learned multiplicity model P(N|E) replacing the bootstrap sampler.
-- Fewer ODE steps at generation (currently 200 Heun steps ≈ 25 s per
-  128-event batch); distillation or a timestep study.
+- Narrow the electron energy-response spread — the clearest quantitative gap.
+  Candidates: larger model (dim 256 / 8 blocks, set aside for cost), per-event
+  loss normalization so high-multiplicity events aren't down-weighted, or
+  conditioning on total deposited energy in addition to N.
+- Optional grid snapping with duplicate merging in `generator.py`, for
+  consumers that need true voxel output.
+- Learned multiplicity model P(N|E) replacing the bootstrap sampler. Lower
+  priority for electrons (P(N|E) is narrow, so the bootstrap is already close
+  to truth-N) than for muons.
+- Fewer ODE steps at generation (200 Heun steps ≈ 25 s per 128-event batch at
+  4096 points, ~125 s at 8192); distillation or a timestep study. This is now
+  the main cost: generating 2000 electron events takes ~33 min.
 - Condition on initial particle direction; extend to the other 8 species in
   the dataset via the (already present, disabled) particle embedding.
 - Per-event loss normalization and OT noise–data matching (upstream
