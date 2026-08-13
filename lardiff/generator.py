@@ -44,6 +44,8 @@ class LArGenerator(nn.Module):
         with open(run_params_file) as f:
             run_params = yaml.load(f, Loader=yaml.FullLoader)
 
+        # v1/v2 runs condition on [E, N]; v3 adds the energy ratio
+        self.cond_dim = run_params["model"]["dim_inputs"][2]
         self.__init_model(run_params["model"], state_dict_file, solver=solver)
         self.__init_trafo(run_params["data"], trafo_file)
         self.to(torch.get_default_dtype())
@@ -82,16 +84,32 @@ class LArGenerator(nn.Module):
         self.samples_coordinate_trafo.load_state_dict(state["samples_coordinate_trafo"])
         self.cond_trafo.load_state_dict(state["cond_trafo"])
 
-    def forward(self, energies: Tensor, num_points: Tensor) -> Tensor:
+    def forward(
+        self,
+        energies: Tensor,
+        num_points: Tensor,
+        ratio: Tensor | None = None,
+        renormalize: bool = False,
+    ) -> Tensor:
         num_points = num_points.clamp(min=1, max=self.max_points)
         device = energies.device
         mask = (
             torch.arange(self.max_points, device=device)[None]
             < num_points[:, None]
         ).unsqueeze(-1)
-        condition = self.cond_trafo(
-            torch.stack([energies, num_points.to(energies.dtype)], dim=-1)
-        )
+        cond_parts = [energies, num_points.to(energies.dtype)]
+        if self.cond_dim > 2:
+            if ratio is None:
+                raise ValueError(
+                    "this run conditions on the energy ratio; supply `ratio`"
+                )
+            cond_parts.append(ratio.to(energies.dtype))
+        elif ratio is not None and renormalize is False:
+            raise ValueError(
+                "this run does not condition on the energy ratio; `ratio` is "
+                "only meaningful here together with renormalize=True"
+            )
+        condition = self.cond_trafo(torch.stack(cond_parts, dim=-1))
         raw_samples = self.flow.sample(
             shape=(condition.shape[0], self.max_points, 4),
             num_timesteps=self.num_timesteps,
@@ -107,38 +125,69 @@ class LArGenerator(nn.Module):
         # so that edep > 0 identifies real hits downstream
         mask = mask & (samples[:, :, [3]] > 0)
         samples[~mask.expand(-1, -1, 4)] = 0
+        if renormalize:
+            if ratio is None:
+                raise ValueError("renormalize=True requires `ratio`")
+            # enforce the predicted total exactly by scaling every hit in the
+            # event; preserves the shape of the cloud and the relative energy
+            # ordering, and only rescales the per-hit spectrum by one factor
+            current = samples[:, :, 3].sum(dim=1)
+            target = ratio.to(samples.dtype) * energies
+            scale = torch.where(
+                current > 0, target / current.clamp_min(1e-12), torch.ones_like(current)
+            )
+            samples[:, :, 3] *= scale[:, None]
         return samples
 
 
 class EmpiricalNSampler:
-    """Sample the number of points given the incident energy by bootstrapping
-    from the training set within log-spaced energy bins."""
+    """Bootstrap (N, R) from the training set within log-spaced energy bins.
+
+    Pairs are drawn together rather than independently, so the N-R correlation
+    survives. This is the training-free baseline the learned global model
+    (lardiff.global_model) has to beat: it reproduces the in-sample joint
+    exactly but cannot interpolate between bins or extrapolate beyond them.
+    """
 
     def __init__(self, num_bins: int = 40) -> None:
         self.num_bins = num_bins
         self.bin_edges: np.ndarray | None = None
         self.bin_values: list[np.ndarray] = []
 
-    def fit(self, energies: np.ndarray, n_points: np.ndarray) -> None:
+    def fit(
+        self,
+        energies: np.ndarray,
+        n_points: np.ndarray,
+        ratios: np.ndarray | None = None,
+    ) -> None:
         log_e = np.log(energies)
         self.bin_edges = np.linspace(log_e.min(), log_e.max(), self.num_bins + 1)
         index = np.clip(
             np.digitize(log_e, self.bin_edges) - 1, 0, self.num_bins - 1
         )
-        self.bin_values = [n_points[index == i] for i in range(self.num_bins)]
+        if ratios is None:
+            ratios = np.full(len(n_points), np.nan)
+        pairs = np.stack([n_points.astype(np.float64), ratios], axis=-1)
+        self.bin_values = [pairs[index == i] for i in range(self.num_bins)]
         for i in range(self.num_bins):
             if len(self.bin_values[i]) == 0:
                 raise ValueError(f"empty energy bin {i}, reduce num_bins")
 
-    def sample(self, energies: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    def sample(
+        self, energies: np.ndarray, rng: np.random.Generator
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self.bin_edges is None:
             raise RuntimeError("call fit() first")
         index = np.clip(
             np.digitize(np.log(energies), self.bin_edges) - 1, 0, self.num_bins - 1
         )
-        return np.array(
-            [rng.choice(self.bin_values[i]) for i in index], dtype=np.int64
+        drawn = np.stack(
+            [
+                self.bin_values[i][rng.integers(len(self.bin_values[i]))]
+                for i in index
+            ]
         )
+        return drawn[:, 0].astype(np.int64), drawn[:, 1]
 
 
 def print_time(text):
@@ -153,20 +202,31 @@ def generate(
     num_points: Tensor,
     batch_size: int | None = None,
     device: str | torch.device = "cpu",
+    ratios: Tensor | None = None,
+    renormalize: bool = False,
 ) -> Tensor:
     if batch_size is None:
         batch_size = energies.shape[0]
     split_energies = torch.split(energies, batch_size, dim=0)
     split_num_points = torch.split(num_points, batch_size, dim=0)
+    if ratios is None:
+        split_ratios: tuple = (None,) * len(split_energies)
+    else:
+        split_ratios = torch.split(ratios, batch_size, dim=0)
 
     generator = generator.to(device)
     generator.eval()
     samples = []
-    for i, (energies_l, num_points_l) in enumerate(
-        zip(split_energies, split_num_points)
+    for i, (energies_l, num_points_l, ratios_l) in enumerate(
+        zip(split_energies, split_num_points, split_ratios)
     ):
         print_time(f"start batch {i:3d}")
-        samples_l = generator(energies_l.to(device), num_points_l.to(device)).cpu()
+        samples_l = generator(
+            energies_l.to(device),
+            num_points_l.to(device),
+            ratio=None if ratios_l is None else ratios_l.to(device),
+            renormalize=renormalize,
+        ).cpu()
         samples.append(samples_l)
     samples = torch.cat(samples)
     print_time("generation done")
@@ -210,9 +270,29 @@ def get_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--n-source",
         default="truth",
-        choices=["truth", "empirical"],
-        help="condition on the true number of points or sample it from "
-        "the training-set empirical distribution P(N|E). default: truth",
+        choices=["truth", "empirical", "global"],
+        help="where the point count (and, for v3 runs, the energy ratio) comes "
+        "from: the held-out truth, a bootstrap of the training set, or a "
+        "trained global model. default: truth",
+    )
+    parser.add_argument(
+        "--global-model",
+        default=None,
+        help="run directory of a trained lardiff.global_model, required for "
+        "--n-source global",
+    )
+    parser.add_argument(
+        "--pdg",
+        default=None,
+        type=int,
+        help="particle code for the global model; defaults to the cache's "
+        "`pdg` attribute",
+    )
+    parser.add_argument(
+        "--renormalize",
+        action="store_true",
+        help="rescale each event's hit energies so the total matches the "
+        "conditioned ratio exactly",
     )
     parser.add_argument("--seed", default=0, type=int)
     return parser.parse_args(args)
@@ -243,6 +323,7 @@ def main(args: list[str] | None = None) -> None:
         solver=parsed_args.solver,
     )
 
+    needs_ratio = generator.cond_dim > 2 or parsed_args.renormalize
     with h5py.File(parsed_args.cache_file, "r") as f:
         data_len = f["energy_MeV"].shape[0]
         first = data_len - parsed_args.num_samples
@@ -254,20 +335,48 @@ def main(args: list[str] | None = None) -> None:
         energies = f["energy_MeV"][first:]
         n_truth = f["n_points"][first:].astype(np.int64)
         cache_index = np.arange(first, data_len, dtype=np.int64)
+        # truth ratio of the held-out events, from the same (possibly
+        # truncated) points the model is trained to reproduce
+        r_truth = (
+            f["points"][first:, :, 3].sum(axis=1) / energies
+        ).astype(np.float64)
+        pdg = parsed_args.pdg or int(f.attrs.get("pdg", 0))
         if parsed_args.n_source == "empirical":
             with open(os.path.join(parsed_args.run_dir, "conf.yaml")) as cf:
                 run_conf = yaml.safe_load(cf)
             val_len = run_conf["data"]["val_len"]
             train_stop = data_len - val_len
             n_sampler = EmpiricalNSampler()
+            train_ratio = None
+            if needs_ratio:
+                train_ratio = (
+                    f["points"][:train_stop, :, 3].sum(axis=1)
+                    / f["energy_MeV"][:train_stop]
+                )
             n_sampler.fit(
-                f["energy_MeV"][:train_stop], f["n_points"][:train_stop]
+                f["energy_MeV"][:train_stop],
+                f["n_points"][:train_stop],
+                train_ratio,
             )
             rng = np.random.default_rng(parsed_args.seed)
-            n_used = n_sampler.sample(energies, rng)
+            n_used, r_used = n_sampler.sample(energies, rng)
+        elif parsed_args.n_source == "global":
+            if not parsed_args.global_model:
+                raise ValueError("--n-source global requires --global-model")
+            from lardiff.global_model import GlobalSampler
+
+            sampler = GlobalSampler(parsed_args.global_model, device=device)
+            n_t, r_t = sampler.sample(
+                torch.from_numpy(energies.astype(np.float32)),
+                pdg=pdg,
+                max_num_points=generator.max_points,
+            )
+            n_used, r_used = n_t.numpy(), r_t.numpy().astype(np.float64)
         else:
-            n_used = n_truth.copy()
+            n_used, r_used = n_truth.copy(), r_truth.copy()
     n_used = np.minimum(n_used, generator.max_points)
+    if needs_ratio and not np.isfinite(r_used).all():
+        raise ValueError("non-finite energy ratios; is the cache missing points?")
 
     samples = generate(
         generator,
@@ -275,6 +384,10 @@ def main(args: list[str] | None = None) -> None:
         torch.from_numpy(n_used),
         parsed_args.batch_size,
         device,
+        ratios=(
+            torch.from_numpy(r_used.astype(np.float32)) if needs_ratio else None
+        ),
+        renormalize=parsed_args.renormalize,
     )
 
     for i in range(100):
@@ -290,8 +403,11 @@ def main(args: list[str] | None = None) -> None:
         f.create_dataset("energy_MeV", data=energies)
         f.create_dataset("n_points_used", data=n_used)
         f.create_dataset("n_points_truth", data=n_truth)
+        f.create_dataset("ratio_used", data=r_used)
+        f.create_dataset("ratio_truth", data=r_truth)
         f.create_dataset("cache_index", data=cache_index)
         f.attrs["cache_file"] = parsed_args.cache_file
+        f.attrs["renormalized"] = parsed_args.renormalize
     with open(os.path.join(parsed_args.run_dir, name + ".yaml"), "w") as f:
         yaml.dump(vars(parsed_args), f)
 

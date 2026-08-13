@@ -118,9 +118,20 @@ def load_and_prepare(
     points = data["points"]
     # padding rows are exact zeros; every real hit has edep > 0
     mask = points[:, :, [3]] > 0
-    # conditioning: [incident energy, number of points]
+    # conditioning: [incident energy, number of points, energy ratio].
+    # The ratio is a global property of the cloud, which a model acting locally
+    # on points reproduces with too wide a spread; supplying it as truth during
+    # training turns it from something to discover into something given.
+    # It is computed from the (possibly truncated) cache so it is exactly the
+    # quantity the model can reproduce.
+    e_total = points[:, :, 3].sum(dim=1)
     cond_raw = torch.stack(
-        [data["energy"], data["n_points"].to(points.dtype)], dim=-1
+        [
+            data["energy"],
+            data["n_points"].to(points.dtype),
+            e_total / data["energy"].clamp_min(1e-6),
+        ],
+        dim=-1,
     )
 
     if do_initialise_trafos:
