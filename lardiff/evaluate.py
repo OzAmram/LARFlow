@@ -50,16 +50,39 @@ def plot_hist(
     logx: bool = False,
     logy: bool = True,
     bins: int = 80,
+    xrange: tuple[float, float] | None = None,
+    show_moments: bool = False,
 ):
+    """Overlaid Geant4/model histogram.
+
+    xrange       explicit binning range, for observables whose outliers would
+                 otherwise stretch the axis and hide the bulk. Entries outside
+                 it are piled into the end bins rather than dropped, so the
+                 plot never hides a tail.
+    show_moments append mean +- std to the legend labels, so a difference in
+                 *width* between the two distributions is readable as a number
+                 and not only as a shape. The moments are of the *unclipped*
+                 data.
+    """
     combined = np.concatenate([gen, g4])
     if logx:
         combined = combined[combined > 0]
-        edges = np.geomspace(combined.min(), combined.max(), bins + 1)
-    else:
-        edges = np.linspace(combined.min(), combined.max(), bins + 1)
+    lo, hi = xrange if xrange is not None else (combined.min(), combined.max())
+    edges = (
+        np.geomspace(lo, hi, bins + 1) if logx else np.linspace(lo, hi, bins + 1)
+    )
     plt.figure(figsize=(6, 4.5))
-    plt.hist(g4, bins=edges, histtype="step", density=True, label="Geant4")
-    plt.hist(gen, bins=edges, histtype="step", density=True, label="Model")
+    labels = ["Geant4", "Model"]
+    if show_moments:  # before clipping, so the numbers describe the real data
+        labels = [
+            f"{name} ({a.mean():.4g} $\\pm$ {a.std():.3g})"
+            for name, a in zip(labels, [g4, gen])
+        ]
+    if xrange is not None:  # pile over/underflow into the end bins
+        margin = (edges[-1] - edges[-2]) * 0.5
+        gen, g4 = (np.clip(a, lo + margin, hi - margin) for a in (gen, g4))
+    plt.hist(g4, bins=edges, histtype="step", density=True, label=labels[0])
+    plt.hist(gen, bins=edges, histtype="step", density=True, label=labels[1])
     if logx:
         plt.xscale("log")
     if logy:
@@ -119,16 +142,32 @@ def plot_response_profile(
 ):
     edges = np.geomspace(e_inc.min(), e_inc.max(), bins + 1)
     centers = np.sqrt(edges[:-1] * edges[1:])
+    index = np.clip(np.digitize(e_inc, edges) - 1, 0, bins - 1)
+    # multiplicative dodge (the axis is log): side-by-side bars instead of one
+    # series drawn on top of the other, and caps so the spreads are comparable
+    dodge = (edges[1] / edges[0]) ** 0.12
     plt.figure(figsize=(6, 4.5))
-    for ratio, label in [(ratio_g4, "Geant4"), (ratio_gen, "Model")]:
+    for ratio, label, shift in [
+        (ratio_g4, "Geant4", 1.0 / dodge),
+        (ratio_gen, "Model", dodge),
+    ]:
         mean = np.full(bins, np.nan)
         std = np.full(bins, np.nan)
-        index = np.clip(np.digitize(e_inc, edges) - 1, 0, bins - 1)
         for i in range(bins):
             sel = ratio[index == i]
             if len(sel) > 1:
                 mean[i], std[i] = sel.mean(), sel.std()
-        plt.errorbar(centers, mean, yerr=std, fmt="o", markersize=3, label=label)
+        plt.errorbar(
+            centers * shift,
+            mean,
+            yerr=std,
+            fmt="o",
+            markersize=3,
+            capsize=3,
+            capthick=1.0,
+            elinewidth=1.0,
+            label=label,
+        )
     plt.xscale("log")
     plt.xlabel("incident energy [MeV]")
     plt.ylabel("total deposited / incident energy")
@@ -212,11 +251,23 @@ def main(args: list[str] | None = None) -> None:
               path("n_hits.pdf"))
     plot_hist(gen_obs["e_total"], g4_obs["e_total"],
               "total deposited energy [MeV]", path("e_total.pdf"), logx=True)
-    plot_response_profile(
-        e_inc,
-        gen_obs["e_total"] / e_inc,
-        g4_obs["e_total"] / e_inc,
-        path("response_profile.pdf"),
+    ratio_gen = gen_obs["e_total"] / e_inc
+    ratio_g4 = g4_obs["e_total"] / e_inc
+    plot_response_profile(e_inc, ratio_gen, ratio_g4, path("response_profile.pdf"))
+    # Bulk of *both* distributions, padded — asymmetric, because the muon
+    # response is long-tailed and a range centred on the median wastes most of
+    # the axis. The outer 0.5% lands in the end bins, so no tail is hidden.
+    lo = min(np.percentile(ratio_g4, 0.5), np.percentile(ratio_gen, 0.5))
+    hi = max(np.percentile(ratio_g4, 99.5), np.percentile(ratio_gen, 99.5))
+    pad = 0.1 * max(hi - lo, 1e-3)
+    plot_hist(
+        ratio_gen,
+        ratio_g4,
+        "total deposited / incident energy",
+        path("response.pdf"),
+        logy=True,
+        xrange=(max(0.0, lo - pad), hi + pad),
+        show_moments=True,
     )
     plot_hist(gen_hits["edep"], g4_hits["edep"], "voxel energy [MeV]",
               path("hit_edep.pdf"), logx=True)

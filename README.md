@@ -122,7 +122,8 @@ Multi-GPU: `torchrun --standalone --nproc_per_node=4 lardiff/train.py
 conf/lar_muon.yaml --ddp` (global batch size is divided across ranks).
 
 Evaluation plots: hit multiplicity, total deposited energy,
-E_dep/E_inc response profile, per-voxel energy spectrum, hit position
+E_dep/E_inc response (both a histogram, with mean ± std in the legend, and a
+profile vs. incident energy), per-voxel energy spectrum, hit position
 distributions, per-axis event extents and energy-weighted centroids,
 per-axis energy profiles (mean deposited energy per event, and mean hit
 energy, vs. x/y/z), and side-by-side truth/model event displays.
