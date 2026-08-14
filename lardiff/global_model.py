@@ -61,11 +61,27 @@ def detect_atoms(
     offsets = {}
     for i in np.unique(label):
         sel = label == i
-        delta = edep[sel] - energy[sel]
-        c = float(np.median(delta))
-        fraction = float(np.mean(np.abs(delta - c) <= tol * energy[sel]))
-        if fraction > 0.02:
-            offsets[int(i)] = c
+        energy_i = energy[sel]
+        # the atom sits at a fixed *energy* offset (0, or 2 m_e for e+), so
+        # search in delta rather than delta/E, where the e+ atom would smear
+        # across three decades of incident energy.  Locate it as the densest
+        # window rather than the median: protons are only ~29% contained, so a
+        # median lands in the escape tail and misses the atom entirely.
+        delta = edep[sel] - energy_i
+        width = tol * energy_i
+        order = np.sort(delta)
+        lo = np.searchsorted(order, delta - width, "left")
+        hi = np.searchsorted(order, delta + width, "right")
+        # the winning candidate is one event's own delta, which for protons
+        # carries ~1e-5 relative summation noise; recentre on the window it
+        # found before measuring the fraction, or the narrow low-energy
+        # tolerances all fall outside it
+        j = np.argmax(hi - lo)
+        peak = np.median(delta[np.abs(delta - delta[j]) <= width[j]])
+        core = np.abs(delta - peak) <= width
+        if core.mean() > 0.02:
+            # the offset itself is an energy, so average deltas, not ratios
+            offsets[int(i)] = float(np.median(delta[core]))
     return offsets
 
 
@@ -234,6 +250,9 @@ class GlobalSampler:
         trafos = torch.load(
             os.path.join(run_dir, "trafos.pt"), map_location="cpu", weights_only=True
         )
+        if "flow_escaped" not in state:
+            # runs from before the containment mixture stored the single flow flat
+            state = {"flow_escaped": state}
 
         def build(dim, key):
             flow = GlobalFlow(
