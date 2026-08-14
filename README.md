@@ -50,9 +50,13 @@ schedulers, loss bookkeeping) is inherited unchanged from AllShowers.
 ```
 conf/lar_muon.yaml            # production config (full cache, 4096 points)
 conf/lar_electron.yaml        # electron config (8192 points, batch 64, 40 epochs)
+conf/lar_electron_v3.yaml     # as above + energy-ratio conditioning (3-dim cond)
 conf/lar_muon_mini.yaml       # small config for smoke tests
+conf/lar_muon_mini_v3.yaml    # smoke test with 3-dim cond
 scripts/preprocess_lar.py     # raw voxel file -> per-particle padded cache
+scripts/preprocess_globals.py # all 9 species -> (E, N, E_dep) cache for the global model
 scripts/train_perlmutter.sh   # single-GPU sbatch script (NERSC Perlmutter)
+scripts/train_global_perlmutter.sh  # same, for the global model
 lardiff/
   transformer.py              # flex-attention encoder + analytic padding BlockMask
   flow_matching.py            # CNF: flow-matching loss + ODE sampling
@@ -61,6 +65,7 @@ lardiff/
   data_loader.py              # in-RAM dataset / loader
   lar_data.py                 # cache reading, trafo fitting, train/val loaders
   train.py                    # Trainer + CLI
+  global_model.py             # p(N, R | E, type) containment mixture + sampler + CLI
   generator.py                # LArGenerator + EmpiricalNSampler + CLI
   evaluate.py                 # Geant4-vs-model validation plots + CLI
 ```
@@ -90,7 +95,8 @@ Normalization (fitted on ≤100k training events, saved to
 `results/<run>/preprocessing/trafos.pt`): per-axis StandardScaler for
 coordinates, `log(edep + 1e-6)` + StandardScaler for the ~9-decade voxel
 energy spectrum, elementwise `log` + StandardScaler for the `(E, N)`
-condition.
+condition — `(E, N, R)` in v3 configs, where `R` is computed from the possibly
+truncated cache so it is exactly what the model can reproduce.
 
 ## Usage
 
@@ -110,11 +116,20 @@ $PY lardiff/train.py conf/lar_muon.yaml            # interactive
 sbatch scripts/train_perlmutter.sh conf/lar_muon.yaml   # batch queue
 $PY lardiff/train.py conf/lar_muon.yaml --fast-dev-run  # 2-epoch smoke test
 
-# 3. generation — conditions on the validation tail of the cache
+# 3. global model p(N, R | E, type) — all 9 species, ~5 min on one A100
+$PY scripts/preprocess_globals.py \
+    --input /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/lar_muon_voxels.h5 \
+    --output /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_globals.h5
+sbatch scripts/train_global_perlmutter.sh results/global_all_species_v3
+
+# 4. generation — conditions on the validation tail of the cache
 $PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source truth
 $PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source empirical
+# v3: take N and R from the global model, and enforce R by rescaling
+$PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source global \
+    --global-model results/global_all_species_v3 --pdg 11 --renormalize
 
-# 4. validation plots -> results/<run>/eval_samplesNN/
+# 5. validation plots -> results/<run>/eval_samplesNN/
 $PY -m lardiff.evaluate results/<run>/samples00.h5 <cache.h5>
 ```
 
@@ -188,6 +203,130 @@ therefore produces collisions: ~5% of electron hits and ~3% of muon hits land
 on an already-occupied voxel, so a snap step must merge duplicates and sum
 their energies rather than assume uniqueness.
 
+## v3: factorized global model
+
+v2's clearest gap was the energy response: the point model's spread was ~3x too
+wide (0.043 vs 0.014). Global quantities like a per-event energy ratio are hard
+for a diffusion model that acts on points locally — nothing in the loss ties the
+4096 independent hit energies together. v3 therefore factorizes the problem: a
+small model predicts the event's global summary first, and the point model
+receives it as conditioning.
+
+The global model is `p(N, R | E, type)`, where `N` is the hit count and
+`R = E_deposited / E_incident` the energy response. It is trained on all 9
+species at once with a particle embedding (one model, ~205k parameters, 4–5 min
+on one A100 for 300 epochs over 1M events — about 0.4% of the point model's
+cost). The point models stay per-species and gain `log R` as a third
+conditioning input alongside `log E` and `log N`. `generator.py --renormalize`
+optionally rescales each generated event's hit energies so its total matches the
+conditioned `R` exactly.
+
+### Why a plain flow is not enough
+
+83% of electrons are *fully contained*: they deposit exactly their incident
+energy, so `R` is precisely 1.0 — not a narrow peak but a genuine point mass.
+`p(R | E)` is therefore a **mixed** distribution, an atom plus a continuous
+escape tail, and a continuous flow cannot represent an atom however long it
+trains. A single joint flow over `(log N, log R)` smears it into a bump, which
+put 35% of sampled electrons at `R > 1` (energy non-conservation) and left only
+38% near 1.0 against a true 83%. Under `--renormalize` that defect would
+propagate straight into the generated showers.
+
+### Finding the atom
+
+The atom is located in the data before any training — it is a labelling step,
+not part of the model. The physical fact it exploits: a fully contained event
+deposits a *fixed* amount relative to its incident energy, so
+`delta = edep - E` takes the same value for every contained event of a species,
+independent of energy. Detection is then just *does one value of `delta` get
+shared by many of this species' events?* — find the densest window in `delta`
+(each event's own `delta` as a candidate centre, counting neighbours within
+`1e-5 * E`), recentre on the window, and declare an atom if it holds >2% of the
+species.
+
+Two details matter. The search must run in `delta`, not `delta / E`: the e+ atom
+sits at a fixed *energy*, so in ratio space it smears across three decades of
+incident energy. And the winning candidate is one event's own `delta`, which
+carries ~1e-5 relative float64 summation noise, so the centre must be refined
+(median over the window) before the fraction is measured — otherwise the narrow
+low-energy tolerances all fall outside it and the atom is missed. An earlier
+version located the atom by the median of `delta`, which only works when the
+atom holds a *majority* of events; protons are 29% contained, so the median
+landed in the escape tail and found nothing.
+
+The detector is given no physics, only `edep` and `E`. It recovers:
+
+| species        | offset      | contained | interpretation                  |
+|----------------|-------------|-----------|---------------------------------|
+| e-             | +0.0000 MeV | 0.832     | deposits exactly its kinetic energy |
+| gamma          | +0.0000 MeV | 0.869     | same                            |
+| e+             | +1.0220 MeV | 0.832     | 2 m_e c^2 — annihilation        |
+| p              | +0.0000 MeV | 0.293     | stops below ~200 MeV            |
+| mu±, pi±, n    | none        | <0.02     | no atom — plain flow            |
+
+The positron offset landing on 2 m_e c^2 to four decimals is a useful check that
+the detector finds real structure rather than fitting noise. Muons have no atom
+(0.0000 of events within 1e-4 of the contained value) despite a very sharp
+*continuous* peak — 41% of mu- land within 2% of `R = 1` — and are correctly
+left to the plain flow.
+
+### The mixture
+
+```
+p(N, R | E, type) = P(contained | E, type) * p(N | E, type, contained) * delta(R - ceiling)
+                  + (1 - P)                * p(N, R | E, type, escaped)
+```
+
+with `ceiling = (E + offset) / E`. Three trained components:
+
+1. **Containment classifier** — `(E, type) -> P(contained)`, a BCE-trained MLP.
+2. **1-D flow over `log N`**, trained on contained events only.
+3. **2-D joint flow over `(log N, log R)`**, trained on escaped events only.
+
+At sampling time containment is drawn from the Bernoulli. If contained, `R` is
+set to the ceiling deterministically — no sampling — but **`N` is still sampled**,
+from flow (2). If escaped, both come from flow (3), with `R` clamped below the
+ceiling since an escaping event deposits less than a contained one by
+definition.
+
+`N` needs its own flow because contained and escaped events have genuinely
+different multiplicity distributions (contained events are the lower-energy ones
+that stop in the volume), so reusing the joint flow would import the escaped
+population's `N`. Sampling the joint flow for contained events does not work
+either, because `R` is degenerate there — precisely the pathology being avoided.
+The contained branch therefore drops the degenerate dimension and models only
+the free one. Species with no detected atom bypass the mixture entirely.
+
+### Global model results
+
+50,000 held-out events, KS against Geant4. Two-sample KS has a ~0.026 critical
+value at these sample sizes.
+
+| species | KS(N) | KS(R) | atom (model / Geant4) |
+|---------|-------|-------|-----------------------|
+| pi-     | 0.014 | 0.016 | — |
+| mu+     | 0.011 | 0.016 | — |
+| e+      | 0.009 | 0.016 | 0.839 / 0.833 |
+| e-      | 0.008 | 0.010 | 0.843 / 0.835 |
+| mu-     | 0.011 | 0.083 | — |
+| gamma   | 0.006 | 0.020 | 0.882 / 0.865 |
+| pi+     | 0.014 | 0.013 | — |
+| n       | 0.010 | 0.029 | — |
+| p       | 0.012 | 0.015 | 0.297 / 0.298 |
+
+The mixture took e- from KS(R) 0.487 to 0.010, gamma from 0.521 to 0.010, and
+(once the detector was fixed) protons from 0.204 to 0.015, with no unphysical
+`R > 1`. `N` was already excellent before the mixture and is unchanged.
+Correlations `corr(log N, R)` are reproduced to ~0.01 for the strongly
+correlated species (p -0.76, pi+ -0.65, e+ -0.63), so the joint structure
+survives rather than just the two marginals.
+
+The one weak entry is mu- at 0.083, which is a property of the statistic rather
+than a physics error: the quantiles agree with Geant4 to ~0.2% throughout
+(median 1.0258 vs 1.0249), but the CDF is nearly vertical through the sharp peak
+at `R = 1`, so a 0.002 shift in `R` registers as KS 0.08. It is stable from 100
+to 400 ODE steps, so it is peak placement, not integration error.
+
 ## torch 2.5 notes
 
 The pinned environment (torch 2.5.1+cu121) has three flex-attention pitfalls
@@ -203,17 +342,16 @@ this repo works around; all disappear with torch ≥ 2.6:
 - `torch.nn.utils.get_total_norm` does not exist yet (local fallback in
   `train.py`).
 
-## Next steps (v2 candidates)
+## Next steps
 
-- Narrow the electron energy-response spread — the clearest quantitative gap.
-  Candidates: larger model (dim 256 / 8 blocks, set aside for cost), per-event
-  loss normalization so high-multiplicity events aren't down-weighted, or
-  conditioning on total deposited energy in addition to N.
+- A/B the v3 factorization on electrons: truth-`R` vs global-model `R`, each
+  with and without `--renormalize`, against the v2 baseline. This is the open
+  question — whether conditioning alone narrows the response spread, or whether
+  enforcing `R` by rescaling is also needed.
 - Optional grid snapping with duplicate merging in `generator.py`, for
   consumers that need true voxel output.
-- Learned multiplicity model P(N|E) replacing the bootstrap sampler. Lower
-  priority for electrons (P(N|E) is narrow, so the bootstrap is already close
-  to truth-N) than for muons.
+- Tighten the global model's mu- peak placement if it matters downstream (a
+  5-minute retrain); see the v3 results above for why the KS overstates it.
 - Fewer ODE steps at generation (200 Heun steps ≈ 25 s per 128-event batch at
   4096 points, ~125 s at 8192); distillation or a timestep study. This is now
   the main cost: generating 2000 electron events takes ~33 min.
