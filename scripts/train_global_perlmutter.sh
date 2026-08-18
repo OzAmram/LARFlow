@@ -14,7 +14,7 @@
 
 OUT=${1:?usage: train_global_perlmutter.sh <out_dir> [extra args]}
 shift
-GLOBALS=/global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_globals.h5
+GLOBALS=/global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_globals_maxp8192.h5
 PY=/global/u1/o/ozamram/personal/envs/ml/bin/python
 
 exec $PY -u -m lardiff.global_model "$GLOBALS" --out "$OUT" "$@"
