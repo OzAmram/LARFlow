@@ -102,6 +102,10 @@ class Trainer:
         self.killed = False
         self.min_val_loss = float("inf")
         self.min_score = float("inf")
+        # the validation loss is evaluated at the same times, on the same
+        # noise, every epoch; see evaluate() and validation_times()
+        self.val_seed = int(conf["train"].get("val_seed", 0))
+        self.val_t: torch.Tensor | None = None
 
         if os.path.exists(self.checkpoint_file):
             self.load()
@@ -213,11 +217,13 @@ class Trainer:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
 
-    def get_loss(self, batch: data_loader.ModelInputDict) -> torch.Tensor:
+    def get_loss(
+        self, batch: data_loader.ModelInputDict, t: torch.Tensor | None = None
+    ) -> torch.Tensor:
         for key in batch:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].to(self.device)
-        losses = self.flow.loss(**batch)
+        losses = self.flow.loss(**batch, t=t)
         losses = losses * batch["mask"].to(losses.dtype)
         losses = torch.mean(losses, dim=(1, 2))
         return losses
@@ -274,13 +280,44 @@ class Trainer:
             print(repr(e))
             sys.stderr.flush()
 
+    def validation_times(self) -> torch.Tensor:
+        """One fixed time per validation event, stratified over (0, 1).
+
+        The CFM loss varies far more with `t` than it does between epochs, so
+        resampling `t` and the noise every epoch turns the validation loss into
+        a fresh Monte Carlo estimate each time.  On the v2/v3 electron runs that
+        left a 0.0015 epoch-to-epoch spread around a 0.0001 real difference, and
+        `best.pt` was effectively picking a random epoch off the plateau.
+
+        Giving event `i` the midpoint of the i-th stratum covers the range
+        exactly rather than approximately, and the fixed permutation keeps `t`
+        from correlating with whatever order the cache happens to be in.
+        """
+        num = len(self.val_loader.data_set)
+        strata = (torch.arange(num, dtype=torch.float32) + 0.5) / num
+        permutation = torch.randperm(
+            num, generator=torch.Generator().manual_seed(self.val_seed)
+        )
+        return strata[permutation]
+
     @torch.no_grad()
     def evaluate(self) -> None:
         self.flow.eval()
+        if self.val_t is None or len(self.val_t) != len(self.val_loader.data_set):
+            self.val_t = self.validation_times()
+        # a fresh generator each epoch reproduces the same noise bit for bit,
+        # which costs nothing to store; the val loader is shuffle=False, so
+        # batch boundaries and shapes line up with the same events every epoch
+        generator = torch.Generator(device="cpu").manual_seed(self.val_seed)
         loss_sum = 0.0
         num_samples = 0
         for batch in self.val_loader:
-            losses = self.get_loss(batch)
+            first = num_samples
+            last = first + len(batch["x"])
+            batch["noise"] = torch.randn(
+                batch["x"].shape, generator=generator, dtype=batch["x"].dtype
+            )
+            losses = self.get_loss(batch, t=self.val_t[first:last])
             loss = torch.mean(losses)
             loss_sum += loss.item() * len(losses)
             num_samples += len(losses)
@@ -373,8 +410,13 @@ class Trainer:
         if bool(self.scores) and (self.scores[-1] < self.min_score):
             self.min_score = self.scores[-1]
 
-        if self.num_epochs == self.epoch:
-            torch.save(flow_state_dict, self.final_file)
+        # keep the latest epoch beside the best one, in the same bare-state-dict
+        # format, so the two can be generated from and compared directly.
+        # Written every epoch rather than only on clean completion, so it also
+        # survives a walltime kill or a preemption.
+        if os.path.exists(self.final_file):
+            os.remove(self.final_file)
+        torch.save(flow_state_dict, self.final_file)
 
         # reinstate interruption handlers
         signal.signal(signal.SIGINT, original_sigint_handler)

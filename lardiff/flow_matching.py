@@ -62,11 +62,19 @@ class CNF(nn.Module):
         self.__calculate_block_mask(kwargs)
         return self.solver(self, z, 1.0, 0.0, num_timesteps, **kwargs)
 
-    def loss(self, x: Tensor, noise: Tensor | None, **kwargs) -> Tensor:
+    def loss(
+        self, x: Tensor, noise: Tensor | None, t: Tensor | None = None, **kwargs
+    ) -> Tensor:
         self.__calculate_block_mask(kwargs)
-        t = torch.rand(
-            [x.shape[0]] + [1] * (x.dim() - 1), device=x.device, dtype=x.dtype
-        )
+        if t is None:
+            t = torch.rand(
+                [x.shape[0]] + [1] * (x.dim() - 1), device=x.device, dtype=x.dtype
+            )
+        else:
+            # one time per event, broadcast over points and features
+            t = t.to(device=x.device, dtype=x.dtype).reshape(
+                [x.shape[0]] + [1] * (x.dim() - 1)
+            )
         z = noise if noise is not None else torch.randn_like(x)
         y = (1 - t) * x + (1e-4 + (1 - 1e-4) * t) * z
         u = (1 - 1e-4) * z - x
