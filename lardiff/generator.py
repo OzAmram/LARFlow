@@ -84,6 +84,22 @@ class LArGenerator(nn.Module):
         self.samples_coordinate_trafo.load_state_dict(state["samples_coordinate_trafo"])
         self.cond_trafo.load_state_dict(state["cond_trafo"])
 
+        # The third conditioning channel used to be the ratio R and is now the
+        # deposited energy (see lar_data.load_and_prepare).  Feeding one to a
+        # model fitted on the other is silently wrong rather than an error, so
+        # check: the scaler's fitted mean is log E_dep (~2.3 to 9.2 over the
+        # 10 MeV - 10 GeV range) for current runs and log R (~0) for old ones.
+        if self.cond_dim > 2:
+            mean = state["cond_trafo"]["sub_modules.1.mean"].flatten()[2].item()
+            if mean < 1.0:
+                raise RuntimeError(
+                    "this run was trained with the energy *ratio* as the third "
+                    f"conditioning channel (fitted log-mean {mean:.4f}); it "
+                    "predates the switch to deposited energy and cannot be "
+                    "generated from with this version. Retrain, or check out "
+                    "the commit the run was trained on."
+                )
+
     def forward(
         self,
         energies: Tensor,
@@ -103,7 +119,9 @@ class LArGenerator(nn.Module):
                 raise ValueError(
                     "this run conditions on the energy ratio; supply `ratio`"
                 )
-            cond_parts.append(ratio.to(energies.dtype))
+            # the third channel is the deposited energy, not the ratio itself;
+            # see the cond_raw comment in lar_data.load_and_prepare
+            cond_parts.append(ratio.to(energies.dtype) * energies)
         elif ratio is not None and renormalize is False:
             raise ValueError(
                 "this run does not condition on the energy ratio; `ratio` is "

@@ -118,18 +118,27 @@ def load_and_prepare(
     points = data["points"]
     # padding rows are exact zeros; every real hit has edep > 0
     mask = points[:, :, [3]] > 0
-    # conditioning: [incident energy, number of points, energy ratio].
-    # The ratio is a global property of the cloud, which a model acting locally
-    # on points reproduces with too wide a spread; supplying it as truth during
-    # training turns it from something to discover into something given.
-    # It is computed from the (possibly truncated) cache so it is exactly the
-    # quantity the model can reproduce.
+    # conditioning: [incident energy, number of points, deposited energy].
+    # The deposited energy is a global property of the cloud, which a model
+    # acting locally on points reproduces with too wide a spread; supplying it
+    # as truth during training turns it from something to discover into
+    # something given.  It comes from the (possibly truncated) cache so it is
+    # exactly the quantity the model can reproduce.
+    #
+    # The channel carries the energy rather than the ratio R = E_dep / E_inc
+    # because every channel goes through the same elementwise Log before a
+    # per-channel StandardScaler.  log E_dep has the same ~1.6 spread as the
+    # other two, whereas log R is dominated by the containment atom at R = 1:
+    # its std is 0.015, so standardizing sent the escape tail to z ~ -16 and
+    # handed cond_embedding one channel an order of magnitude larger than the
+    # rest.  No information is lost -- cond_embedding is Linear, so it can form
+    # log R = log E_dep - log E_inc itself from channels 0 and 2.
     e_total = points[:, :, 3].sum(dim=1)
     cond_raw = torch.stack(
         [
             data["energy"],
             data["n_points"].to(points.dtype),
-            e_total / data["energy"].clamp_min(1e-6),
+            e_total.clamp_min(1e-6),
         ],
         dim=-1,
     )
