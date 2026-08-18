@@ -51,6 +51,7 @@ schedulers, loss bookkeeping) is inherited unchanged from AllShowers.
 conf/lar_muon.yaml            # production config (full cache, 4096 points)
 conf/lar_electron.yaml        # electron config (8192 points, batch 64, 40 epochs)
 conf/lar_electron_v3.yaml     # as above + energy-ratio conditioning (3-dim cond)
+conf/lar_electron_v4.yaml     # v3 + deposited-energy cond channel, deterministic val
 conf/lar_muon_mini.yaml       # small config for smoke tests
 conf/lar_muon_mini_v3.yaml    # smoke test with 3-dim cond
 scripts/preprocess_lar.py     # raw voxel file -> per-particle padded cache
@@ -95,8 +96,10 @@ Normalization (fitted on ≤100k training events, saved to
 `results/<run>/preprocessing/trafos.pt`): per-axis StandardScaler for
 coordinates, `log(edep + 1e-6)` + StandardScaler for the ~9-decade voxel
 energy spectrum, elementwise `log` + StandardScaler for the `(E, N)`
-condition — `(E, N, R)` in v3 configs, where `R` is computed from the possibly
-truncated cache so it is exactly what the model can reproduce.
+condition — `(E, N, E_dep)` in v3/v4 configs, where `E_dep` is summed over the
+possibly truncated cache so it is exactly what the model can reproduce. v3
+carried the ratio `R = E_dep / E_inc` in that slot instead; see *Conditioning on
+deposited energy rather than the ratio* for why it moved.
 
 ## Usage
 
@@ -117,17 +120,20 @@ sbatch scripts/train_perlmutter.sh conf/lar_muon.yaml   # batch queue
 $PY lardiff/train.py conf/lar_muon.yaml --fast-dev-run  # 2-epoch smoke test
 
 # 3. global model p(N, R | E, type) — all 9 species, ~5 min on one A100
+#    --max-points must match the point-cloud cache, or R means two different
+#    things in the two models (see "Matching the truncation" below)
 $PY scripts/preprocess_globals.py \
     --input /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/lar_muon_voxels.h5 \
-    --output /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_globals.h5
-sbatch scripts/train_global_perlmutter.sh results/global_all_species_v3
+    --output /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_globals_maxp8192.h5 \
+    --max-points 8192
+sbatch scripts/train_global_perlmutter.sh results/global_all_species_v5
 
 # 4. generation — conditions on the validation tail of the cache
 $PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source truth
 $PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source empirical
 # v3: take N and R from the global model, and enforce R by rescaling
 $PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source global \
-    --global-model results/global_all_species_v3 --pdg 11 --renormalize
+    --global-model results/global_all_species_v5 --pdg 11 --renormalize
 
 # 5. validation plots -> results/<run>/eval_samplesNN/
 $PY -m lardiff.evaluate results/<run>/samples00.h5 <cache.h5>
@@ -302,21 +308,33 @@ the free one. Species with no detected atom bypass the mixture entirely.
 50,000 held-out events, KS against Geant4. Two-sample KS has a ~0.026 critical
 value at these sample sizes.
 
-| species | KS(N) | KS(R) | atom (model / Geant4) |
-|---------|-------|-------|-----------------------|
-| pi-     | 0.014 | 0.016 | — |
-| mu+     | 0.011 | 0.016 | — |
-| e+      | 0.009 | 0.016 | 0.839 / 0.833 |
-| e-      | 0.008 | 0.010 | 0.843 / 0.835 |
-| mu-     | 0.011 | 0.083 | — |
-| gamma   | 0.006 | 0.020 | 0.882 / 0.865 |
-| pi+     | 0.014 | 0.013 | — |
-| n       | 0.010 | 0.029 | — |
-| p       | 0.012 | 0.015 | 0.297 / 0.298 |
+`v3` was fit on untruncated globals, `v5` on the file described under "Matching
+the truncation". Both are scored against the capped `R` the point cache actually
+holds, with `N` clamped at 8192 on both sides, so the `v3` column here is not
+the same measurement as the one it was originally reported with.
 
-The mixture took e- from KS(R) 0.487 to 0.010, gamma from 0.521 to 0.010, and
-(once the detector was fixed) protons from 0.204 to 0.015, with no unphysical
-`R > 1`. `N` was already excellent before the mixture and is unchanged.
+| species | v3 KS(N) | v3 KS(R) | v5 KS(N) | v5 KS(R) | v5 atom / Geant4 |
+|---------|----------|----------|----------|----------|------------------|
+| pi-     | 0.011 | 0.008 | 0.016 | 0.010 | — |
+| mu+     | 0.007 | 0.013 | 0.010 | 0.007 | — |
+| e+      | 0.008 | 0.026 | 0.007 | 0.023 | 0.802 / 0.818 |
+| e-      | 0.005 | 0.026 | 0.007 | 0.018 | 0.813 / 0.819 |
+| mu-     | 0.015 | 0.077 | 0.014 | 0.033 | — |
+| gamma   | 0.006 | 0.032 | 0.006 | 0.022 | 0.831 / 0.846 |
+| pi+     | 0.011 | 0.011 | 0.017 | 0.013 | — |
+| n       | 0.017 | 0.029 | 0.016 | 0.011 | — |
+| p       | 0.019 | 0.027 | 0.008 | 0.014 | 0.295 / 0.298 |
+
+Matching the truncation improves `KS(R)` for every species and leaves `KS(N)`
+essentially unchanged. The remaining atom-fraction gaps (e+ and gamma about
+0.015 low, ~3 sigma on 5,500 events) are classifier training noise: the
+containment labels are identical between runs, and the classifier sees only the
+incident energy.
+
+Against the untruncated reference the mixture had taken e- from KS(R) 0.487 to
+0.010, gamma from 0.521 to 0.010, and (once the detector was fixed) protons from
+0.204 to 0.015, with no unphysical `R > 1`. `N` was already excellent before the
+mixture and is unchanged.
 Correlations `corr(log N, R)` are reproduced to ~0.01 for the strongly
 correlated species (p -0.76, pi+ -0.65, e+ -0.63), so the joint structure
 survives rather than just the two marginals.
@@ -326,6 +344,127 @@ than a physics error: the quantiles agree with Geant4 to ~0.2% throughout
 (median 1.0258 vs 1.0249), but the CDF is nearly vertical through the sharp peak
 at `R = 1`, so a 0.002 shift in `R` registers as KS 0.08. It is stable from 100
 to 400 ODE steps, so it is peak placement, not integration error.
+
+### Does renormalization help?
+
+Six generation runs on the same 5,000-event validation tail of
+`lar_pdg11_maxp8192.h5` (heun, 200 steps). "truth-R" feeds the model the true
+ratio; "global-R" samples it from the global model.
+
+| run | response | Geant4 | frac `R = 1` |
+|-----|----------|--------|--------------|
+| v2 truth-N            | 0.9953 ± 0.0429 | 0.9964 ± 0.0143 | 0.001 / 0.792 |
+| v2 truth-N +renorm    | 0.9964 ± 0.0143 | 0.9964 ± 0.0143 | 0.792 / 0.792 |
+| v3 truth-R            | 1.0429 ± 0.0621 | 0.9966 ± 0.0147 | 0.000 / 0.798 |
+| v3 truth-R +renorm    | 0.9966 ± 0.0147 | 0.9966 ± 0.0147 | 0.798 / 0.798 |
+| v3 global-R           | 1.0415 ± 0.0607 | 0.9966 ± 0.0147 | 0.000 / 0.798 |
+| v3 global-R +renorm   | 0.9973 ± 0.0152 | 0.9966 ± 0.0147 | 0.836 / 0.798 |
+
+Renormalization is not optional, for the same reason the global model needs a
+containment mixture. About 79% of Geant4 electron events deposit their full
+energy, so `R = 1` exactly — a point mass. The point model's total is a sum of
+thousands of independently emitted hits, and it lands on that atom essentially
+never (0.001 and 0.000 above). Rescaling to a target `R` is the only mechanism
+in the pipeline that can restore it.
+
+It is also close to free. On the v2 model the per-hit edep spectrum is within
+0.3% of Geant4 at every percentile from p1 to p99.99, renormalized or not: the
+correction factors are small and randomly signed, so they do not bias the shape.
+What renormalization cannot fix is a *shape* error. The v3 point model's
+spectrum is tilted (p99.9 at 1.109, p50 at 0.985), and rescaling slides the tilt
+down rather than flattening it — p50 drops to 0.947 while p99.9 is still 1.067.
+
+Conditioning the point model on `R` did not work: given the exact truth ratio it
+reproduces it no better than the v2 model that never saw it (per-event
+`|R_gen - R_truth| / R_truth` median 4.6% vs 2.0%). The training signal is the
+problem — hits are emitted independently with no feedback from a running total,
+and a 5% shift in the upper edep tail is ~6e-4 of a loss of 0.27. The two runs'
+best validation losses differ by 0.00007 against an epoch-to-epoch spread of
+0.0015, so they are indistinguishable, and the v3 spectrum tilt is run-to-run
+variance rather than evidence that the extra input hurts.
+
+The encoding was also defective, which is fixed as of the next section. Every
+`cond` channel goes through the same elementwise `Log` before a per-channel
+`StandardScaler`. `log E` and `log N` have std ~1.59, but `log R` has std
+**0.0154**, dominated by the containment atom — so standardizing sent the escape
+tail to **z = -54.9** and handed the shared `cond_embedding` one channel more
+than an order of magnitude larger than the other two.
+
+### Conditioning on deposited energy rather than the ratio
+
+The third channel now carries `E_dep` rather than `R = E_dep / E_inc`. On the
+electron cache:
+
+| channel | log-space std | z-range after StandardScaler |
+|---------|---------------|------------------------------|
+| `log E_inc`      | 1.5872 | [-2.47, +1.88] |
+| `log N`          | 1.5966 | [-3.14, +1.38] |
+| `log E_dep` (now)| 1.5855 | [-2.66, +1.87] |
+| `log R` (before) | 0.0154 | **[-54.92, +0.21]** |
+
+No information is lost: `cond_embedding` is a `Linear`, so it can form
+`log R = log E_dep - log E_inc` from channels 0 and 2 in its first layer. The
+generator multiplies the sampled ratio back up by the incident energy before
+building `cond`, so the CLI is unchanged. Runs trained before this switch raise
+an error at load rather than being silently fed the wrong quantity.
+
+### Deterministic validation loss
+
+`CNF.loss` draws both `t ~ U(0, 1)` and the noise fresh on every call, so the
+validation loss was a new Monte Carlo estimate each epoch. The CFM loss varies
+far more with `t` than it does between neighbouring epochs, and on the electron
+runs that left an epoch-to-epoch spread of **0.0015** around a real v2-v3
+difference of **0.00007** — `best.pt`, the argmin of that sequence, was
+effectively picking a random epoch off the plateau (epoch 38 for v2, 27 for v3).
+Any comparison between the two checkpoints was therefore measuring the draw.
+
+Validation now uses the same times and the same noise every epoch:
+
+- each validation event gets one fixed time, the midpoint of its stratum,
+  `t_i = (i + 0.5) / N_val`, under a fixed permutation so `t` does not correlate
+  with cache order. This covers `(0, 1)` exactly rather than approximately.
+- the noise comes from a `torch.Generator` reseeded at the start of every
+  `evaluate()`, which reproduces it bit for bit at no storage cost (the
+  alternative, a stored tensor, is 1.3 GB at `val_len` 10240 × 8192 points).
+  The validation loader is `shuffle=False`, so batch boundaries line up with the
+  same events every epoch.
+
+Repeated `evaluate()` calls on unchanged weights now return bit-identical
+losses, while still responding to the weights. The seed is `train.val_seed`
+(default 0). Training is untouched — `t` and the noise are still i.i.d. there.
+Validation losses are not comparable across this change.
+
+### Matching the truncation
+
+`R` must mean the same thing in both models. The point-cloud caches keep only
+the `max_num_points` highest-edep hits, so the point model's `R` is the energy
+in *those* hits over `E_inc`. The globals cache originally stored the
+untruncated sum, on the assumption that the dropped energy was negligible — it
+is, in the mean (~0.05% for electrons at 8192 points), but that is the wrong
+statistic. About 6% of events exceed the cap, and dropping any hit from a fully
+contained event moves it off `R = 1`, so the untruncated file puts 85% of
+electrons on the containment atom where the capped cache has 82%. A global
+model fit on it over-produces contained events by that margin.
+
+`preprocess_globals.py --max-points K` therefore sums only the `K` highest-edep
+hits, reproducing the cache to float32 rounding. The untruncated total stays in
+`edep_total_full_MeV` for reference.
+
+`N` needs the opposite treatment, and capping it too is a mistake worth naming.
+Truncation only ever *clamps* the count, so leaving `n_hits` untruncated and
+clamping at generation — which `GlobalSampler.sample(max_num_points=K)` already
+does — reproduces the capped distribution exactly, point mass at `K` included.
+Capping it in the training data instead makes the flow responsible for that
+point mass, and a continuous flow over `log N` cannot express one: it is the
+same pathology that forced the containment mixture, reintroduced in the other
+coordinate. Measured, on the electron/gamma/pion species where ~6% of events hit
+the cap, `KS(N)` rose from 0.005–0.019 to 0.021–0.033 and came back down when
+`N` was left untruncated.
+
+One cap covers the whole file, so it should match the cache the model will be
+paired with; muons are the only species where the caps differ materially (0.4%
+exceed 4096 against 0.01% exceeding 8192) and they carry no containment atom, so
+a single 8192 file serves every cache in use.
 
 ## torch 2.5 notes
 
@@ -344,10 +483,14 @@ this repo works around; all disappear with torch ≥ 2.6:
 
 ## Next steps
 
-- A/B the v3 factorization on electrons: truth-`R` vs global-model `R`, each
-  with and without `--renormalize`, against the v2 baseline. This is the open
-  question — whether conditioning alone narrows the response spread, or whether
-  enforcing `R` by rescaling is also needed.
+- Make `--renormalize` the default for generation, and generate
+  v2 + global-model `R` + `--renormalize` to confirm it — that combination is
+  the best on the numbers above but has not been run (the v2 model takes no `R`
+  token, so the two halves are independent and the existing
+  `--n-source global --renormalize` path should just work).
+- Retrain the electron v3 model with the deposited-energy conditioning channel
+  and the deterministic validation loss, then re-judge whether conditioning
+  earns its place. The previous verdict was confounded on both counts.
 - Optional grid snapping with duplicate merging in `generator.py`, for
   consumers that need true voxel output.
 - Tighten the global model's mu- peak placement if it matters downstream (a
