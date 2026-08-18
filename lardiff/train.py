@@ -109,6 +109,43 @@ class Trainer:
 
         if os.path.exists(self.checkpoint_file):
             self.load()
+        elif conf["train"].get("init_weights"):
+            self.warm_start(conf["train"]["init_weights"])
+
+    def warm_start(self, weights_file: str) -> None:
+        """Start from another run's weights, with a fresh optimizer and schedule.
+
+        Resuming a finished run by raising num_epochs does not work: the
+        scheduler's state dict carries T_max, so load() overwrites the new
+        horizon with the old one and CosineAnnealingLR -- periodic in
+        last_epoch -- walks back *up* past its minimum.  A warm start sidesteps
+        that by taking only the weights, so the new run gets its own warmup and
+        its own cosine down to zero.  Only applied when no checkpoint exists,
+        so a preempted warm-started run still resumes normally.
+        """
+        state = torch.load(weights_file, map_location=self.device, weights_only=True)
+        # torch.compile prefixes keys with _orig_mod. and DDP with module.;
+        # match whatever this run's flow actually has
+        target = set(self.flow.state_dict().keys())
+        variants = [
+            state,
+            {k.replace("_orig_mod.", ""): v for k, v in state.items()},
+            {k.replace("network.", "network._orig_mod.", 1): v
+             for k, v in state.items()},
+        ]
+        for candidate in variants:
+            if set(candidate.keys()) == target:
+                state = candidate
+                break
+        else:
+            raise RuntimeError(
+                f"{weights_file} does not match this model: "
+                f"{len(set(state) ^ target)} keys differ, e.g. "
+                f"{sorted(set(state) ^ target)[:3]}"
+            )
+        self.flow.load_state_dict(state, strict=True)
+        print(f"[rank={self.rank}]: warm started from {weights_file}.")
+        sys.stdout.flush()
 
     def init_model(self, model_config: dict[str, Any]) -> None:
         if "flow_config" in model_config:

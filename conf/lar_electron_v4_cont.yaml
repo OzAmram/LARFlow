@@ -1,0 +1,47 @@
+# Continuation of LAr-electron-CNF-v4, which was still improving when its
+# 40-epoch cosine ran out (val loss 0.27040 and falling ~2e-5/epoch).
+#
+# This is a warm start, not a resume.  Raising num_epochs on the finished run
+# would not work: CosineAnnealingLR.state_dict() carries T_max, so Trainer.load
+# restores the old 40-epoch horizon, and the cosine -- periodic in last_epoch --
+# climbs back up past its minimum.  train.init_weights instead takes only the
+# weights, so this run gets its own warmup and its own cosine down to zero.
+#
+# Peak LR is 30% of the original.  Everything else matches lar_electron_v4.yaml,
+# so the architecture and the deterministic validation loss carry over.
+run_name: LAr-electron-CNF-v4-cont
+
+data:
+  path: /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_pdg11_maxp8192.h5
+  max_num_points: 8192
+  val_len: 10240  # multiple of batch size, avoids BlockMask recompile on a ragged last batch
+  samples_coordinate_trafo:
+    - [StandardScaler, {shape: [1, 1, 3]}]
+  samples_energy_trafo:
+    - [Log, {alpha: 1.0e-6}]
+    - [StandardScaler, {shape: [1, 1]}]
+  cond_trafo:
+    - [Log, {alpha: 0.0}]
+    - [StandardScaler, {shape: [1, 3]}]
+
+model:
+  dim_inputs: [4, 6, 3]
+  dim_embedding: 128
+  num_head: 8
+  num_blocks: 6
+  dim_feedforward: 512
+  num_particles: 1
+  activation: GELU
+  flow_config:
+    frequencies: 3
+
+train:
+  num_epochs: 80
+  batch_size: 64
+  learning_rate: 3.e-4
+  optimizer: AdamW
+  scheduler: CosineWarmup
+  weight_decay: 1.e-2
+  grad_clip: 0.2
+  val_seed: 0
+  init_weights: /global/u1/o/ozamram/personal/LAR_Diffu/lardiff/results/20260817_091516_LAr-electron-CNF-v4/weights/final.pt
