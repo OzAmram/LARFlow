@@ -27,6 +27,41 @@ in [results.md](results.md).
 
 The global model covers all nine species and pairs with any point model.
 
+## Shared copy on CFS
+
+Home directories are not group-readable on NERSC and cannot be made so without
+exposing the whole home, so everything a collaborator needs lives under the
+project directory instead, group `m2612`, group-readable:
+
+```
+/global/cfs/cdirs/m2612/ozamram/LAR_Diffu/
+  lar_muon_voxels.h5    # raw ToyG4 events
+  cache/                # preprocessed caches
+  results/              # trained models, configs, transforms, plots
+```
+
+Point the commands below at `$SHARED/results/<run>` instead of `results/<run>`:
+
+```bash
+SHARED=/global/cfs/cdirs/m2612/ozamram/LAR_Diffu
+```
+
+Two things to know about that copy:
+
+- **It is a snapshot, not a live mirror.** Training writes to the home checkout,
+  so re-sync after a run finishes:
+  `rsync -a results/ $SHARED/results/ && chgrp -R m2612 $SHARED/results && chmod -R g+rX $SHARED/results`
+- **`result_path` inside each copied `conf.yaml` still points at the home
+  checkout.** Generation and evaluation ignore it — they resolve everything
+  relative to the run directory you pass — but *resuming training* from the CFS
+  copy would try to write back to the home path and fail. Resume from the home
+  checkout, or edit `result_path` first.
+
+Directories carry the setgid bit, so files created there inherit `m2612` rather
+than the personal group. That is what was wrong originally: the project
+subdirectory was group `ozamram`, so nothing under it was reachable by the
+project group even though the mode bits looked permissive.
+
 ## Layout
 
 ```
