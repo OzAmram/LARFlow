@@ -155,7 +155,10 @@ done
 # interactive, and a 2-epoch smoke test that writes to results/test
 $PY lardiff/train.py conf/lar_electron_v4.yaml
 $PY lardiff/train.py conf/lar_allspecies_v6.yaml --fast-dev-run
-torchrun --standalone --nproc_per_node=4 lardiff/train.py conf/... --ddp
+# note: the module entry point, not the `torchrun` script -- its shebang points
+# at the interpreter the env was built with and does not resolve here
+$PY -m torch.distributed.run --standalone --nproc_per_node=4 \
+    lardiff/train.py conf/... --ddp
 ```
 
 Progress is `results/<run>/data/losses.txt` (train and validation, one row per

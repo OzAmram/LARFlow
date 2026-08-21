@@ -32,5 +32,9 @@ else
     echo "starting a new run from $CONF"
 fi
 
-exec $(dirname $PY)/torchrun --standalone --nproc_per_node=4 \
+# not the `torchrun` console script: its shebang is the absolute path of the
+# interpreter the env was *built* with (/workspace/...), which does not exist
+# here, so it dies with "bad interpreter".  The module entry point is the same
+# code without a shebang in the way.
+exec $PY -m torch.distributed.run --standalone --nproc_per_node=4 \
     lardiff/train.py "$CONF" --ddp
