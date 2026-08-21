@@ -1,0 +1,52 @@
+# All nine species in one model, conditioned on particle type.
+#
+# The type enters as a learned embedding rather than a one-hot vector fed
+# through cond_embedding: nn.Embedding(9, dim_embedding) is exactly a one-hot
+# times a weight matrix, but it keeps the type out of the Log/StandardScaler
+# chain that the continuous conditioning channels go through, where a
+# categorical code has no meaning.  Transformer adds it as a second global
+# token alongside the cond token, so it can shift every point's velocity.
+#
+# The cache is packed rather than padded: a million events at 8192 points is
+# 131 GB dense, so lar_data.H5DataSet reads and pads each batch as it goes.
+#
+# 30% of the events are withheld from training.  Validation monitors the first
+# val_len of that holdout -- scoring all 300k every epoch would cost a large
+# fraction of an epoch -- and the rest is untouched, for generation and
+# evaluation after the run.
+#
+# Four A100s, so batch_size is the global batch and each rank sees 64, matching
+# the single-GPU electron runs.  Peak LR is sqrt(4) x their 1.e-3.
+run_name: LAr-allspecies-CNF-v6
+data:
+  path: /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_all_species_maxp8192.h5
+  max_num_points: 8192
+  val_len: 10240
+  holdout_frac: 0.3
+  samples_coordinate_trafo:
+    - [StandardScaler, {shape: [1, 1, 3]}]
+  samples_energy_trafo:
+    - [Log, {alpha: 1.0e-6}]
+    - [StandardScaler, {shape: [1, 1]}]
+  cond_trafo:
+    - [Log, {alpha: 0.0}]
+    - [StandardScaler, {shape: [1, 3]}]
+model:
+  dim_inputs: [4, 6, 3]
+  dim_embedding: 128
+  num_head: 8
+  num_blocks: 6
+  dim_feedforward: 512
+  num_particles: 9
+  activation: GELU
+  flow_config:
+    frequencies: 3
+train:
+  num_epochs: 100
+  batch_size: 256
+  learning_rate: 2.e-3
+  optimizer: AdamW
+  scheduler: CosineWarmup
+  weight_decay: 1.e-2
+  grad_clip: 0.2
+  val_seed: 0

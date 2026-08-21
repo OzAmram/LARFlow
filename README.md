@@ -11,10 +11,32 @@ permutation-equivariant transformer backbone learns the distribution of hits
 conditioned on the incident particle energy and the number of hits, and
 generates events by integrating the learned ODE from Gaussian noise.
 
-v1 targets negative muons (PDG 13) only and builds the complete pipeline:
-preprocessing, training, generation, and validation plots. v2 adds an
-independently trained electron (PDG 11) model using the same code and an
-8192-point cache; the two are separate runs, not a joint multi-particle model.
+### Versions
+
+| | what it added |
+|---|---|
+| v1 | muons (PDG 13); the whole pipeline — preprocess, train, generate, evaluate |
+| v2 | electrons (PDG 11), 8192-point cache; a separate run, not a joint model |
+| v3 | factorised global model `p(N, R \| E, type)`; point model conditioned on `R` |
+| v4 | third conditioning channel carries `E_dep` rather than `R`; deterministic validation loss |
+| v4-cont | v4 warm-started and run to convergence (80 more epochs) |
+| v5 | global model refit so its `R` matches the point cache's truncation |
+| **v6** | **one point model for all 9 species, conditioned on particle type** (training now) |
+
+Everything through v5 is a *per-species* point model. v6 is the first joint one.
+
+### Current models
+
+Use these unless you have a reason not to.
+
+| purpose | run directory |
+|---|---|
+| electrons | `results/20260818_121435_LAr-electron-CNF-v4-cont` |
+| muons | `results/20260810_154350_LAr-muon-CNF` |
+| global `p(N, R \| E, type)`, all species | `results/global_all_species_v5` |
+| all species, type-conditioned | `results/*_LAr-allspecies-CNF-v6` (in progress) |
+
+The global model is all-species already and pairs with any point model.
 
 ## Relation to AllShowers
 
@@ -32,31 +54,41 @@ are simplified adaptations. The LAr-specific changes:
   built analytically from the per-event hit count via
   `BlockMask.from_kv_blocks` (possible because padding is always a contiguous
   suffix), avoiding `create_block_mask` entirely — see *torch 2.5 notes*.
-- **Scalar conditioning.** The model conditions on `[log E_incident, log N]`
-  through the global conditioning token, replacing the per-layer histogram
-  MLP. At generation time N comes either from held-out truth (for one-to-one
-  validation) or from an empirical bootstrap of P(N|E) (40 log-spaced energy
-  bins over the training set) — the stand-in for AllShowers' external
-  PointCountFM model.
+- **Scalar conditioning.** The model conditions on
+  `[log E_incident, log N, log E_dep]` through the global conditioning token,
+  replacing the per-layer histogram MLP. At generation time `N` and the
+  response come from the held-out truth, an empirical bootstrap of `P(N|E)`,
+  or the trained global model of v3 — which is this repo's stand-in for
+  AllShowers' external PointCountFM, and does rather more (see v3 below).
 - **Direct HDF5 data path.** The `showerdata` package is replaced by a
   one-time preprocessing script plus a plain h5py loader. The `rangerlite`
-  optimizer dependency is dropped (AdamW default).
+  optimizer dependency is dropped (AdamW default). The all-species cache is
+  read out of core, which needs its own loader — see *Out-of-core data*.
+
+AllShowers' particle embedding, unused through v5, is what v6 turns on for
+multi-species training.
 
 Training infrastructure (checkpoint/resume, DDP via torchrun, torch.compile,
-schedulers, loss bookkeeping) is inherited unchanged from AllShowers.
+schedulers, loss bookkeeping) is inherited from AllShowers, with two additions:
+a deterministic validation loss, and `train.init_weights` for warm starts.
 
 ## Repository layout
 
 ```
-conf/lar_muon.yaml            # production config (full cache, 4096 points)
-conf/lar_electron.yaml        # electron config (8192 points, batch 64, 40 epochs)
-conf/lar_electron_v3.yaml     # as above + energy-ratio conditioning (3-dim cond)
+conf/lar_muon.yaml            # muons, 4096 points
+conf/lar_electron.yaml        # electrons, 8192 points, batch 64, 40 epochs (v2)
+conf/lar_electron_v3.yaml     # + energy-ratio conditioning (3-dim cond)
 conf/lar_electron_v4.yaml     # v3 + deposited-energy cond channel, deterministic val
+conf/lar_electron_v4_cont.yaml  # warm start of v4, 80 more epochs
+conf/lar_allspecies_v6.yaml   # all 9 species, type-conditioned, 100 epochs, 4-GPU
 conf/lar_muon_mini.yaml       # small config for smoke tests
 conf/lar_muon_mini_v3.yaml    # smoke test with 3-dim cond
-scripts/preprocess_lar.py     # raw voxel file -> per-particle padded cache
+scripts/preprocess_lar.py     # raw voxel file -> ONE species, dense padded cache
+scripts/preprocess_lar_all.py # raw voxel file -> ALL species, packed cache
 scripts/preprocess_globals.py # all 9 species -> (E, N, E_dep) cache for the global model
 scripts/train_perlmutter.sh   # single-GPU sbatch script (NERSC Perlmutter)
+scripts/train_resume_perlmutter.sh  # single-GPU, resumes an existing run if there is one
+scripts/train_ddp_perlmutter.sh     # 4-GPU DDP, same resume behaviour
 scripts/train_global_perlmutter.sh  # same, for the global model
 lardiff/
   transformer.py              # flex-attention encoder + analytic padding BlockMask
@@ -64,7 +96,7 @@ lardiff/
   ode_solvers.py              # euler / heun / midpoint integrators
   preprocessing.py            # Log / Affine / StandardScaler transformations
   data_loader.py              # in-RAM dataset / loader
-  lar_data.py                 # cache reading, trafo fitting, train/val loaders
+  lar_data.py                 # cache reading, trafo fitting, loaders (dense + packed)
   train.py                    # Trainer + CLI
   global_model.py             # p(N, R | E, type) containment mixture + sampler + CLI
   generator.py                # LArGenerator + EmpiricalNSampler + CLI
@@ -92,62 +124,166 @@ Padding rows are exact zeros; `edep > 0` identifies real hits everywhere.
 Because hits are sorted by descending edep, a smaller `max_num_points` at
 load time keeps the most important hits for free.
 
+`preprocess_lar_all.py` keeps **every** species and writes a *packed* cache
+instead, because the dense form of all nine is 131 GB. Same per-event fields,
+plus a species code, and the hits stored end to end:
+
+| dataset      | shape      | content                                       |
+|--------------|------------|-----------------------------------------------|
+| `hits`       | (H, 4)     | `[x_mm, y_mm, z_mm, edep_MeV]`, no padding    |
+| `offsets`    | (N_ev + 1,)| `hits[offsets[i]:offsets[i+1]]` is event `i`  |
+| `pdg`        | (N_ev,)    | PDG code per event                            |
+| `label`      | (N_ev,)    | index into the `species` file attribute       |
+| `perm`       | (N_ev,)    | a fixed-seed shuffle, unused by default       |
+
+Either layout is accepted everywhere: `lar_data` picks the loader, and
+`generator.py` and `evaluate.py` both detect the packed one by the presence of
+`hits`. See *Out-of-core data* under v6 for why it is packed and not padded.
+
 Normalization (fitted on ≤100k training events, saved to
 `results/<run>/preprocessing/trafos.pt`): per-axis StandardScaler for
 coordinates, `log(edep + 1e-6)` + StandardScaler for the ~9-decade voxel
 energy spectrum, elementwise `log` + StandardScaler for the `(E, N)`
-condition — `(E, N, E_dep)` in v3/v4 configs, where `E_dep` is summed over the
+condition — `(E, N, E_dep)` from v4 on, where `E_dep` is summed over the
 possibly truncated cache so it is exactly what the model can reproduce. v3
 carried the ratio `R = E_dep / E_inc` in that slot instead; see *Conditioning on
-deposited energy rather than the ratio* for why it moved.
+deposited energy rather than the ratio* for why it moved. Runs trained before
+that switch raise an error at generation rather than being silently fed the
+wrong quantity.
 
 ## Usage
 
 ```bash
 PY=/global/u1/o/ozamram/personal/envs/ml/bin/python   # torch 2.5.1 + h5py
 $PY -m pip install -e .                                # once
-
-# 1. one-time preprocessing (a few minutes; run where CFS I/O is fast)
-$PY scripts/preprocess_lar.py \
-    --input /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/lar_muon_voxels.h5 \
-    --output /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_pdg13_maxp4096.h5 \
-    --pdg 13 --max-points 4096
-
-# 2. training  (~4.5 min/epoch on one A100 at batch 128; auto-resumes from
-#    checkpoints/last.pt if the result dir already exists in the conf copy)
-$PY lardiff/train.py conf/lar_muon.yaml            # interactive
-sbatch scripts/train_perlmutter.sh conf/lar_muon.yaml   # batch queue
-$PY lardiff/train.py conf/lar_muon.yaml --fast-dev-run  # 2-epoch smoke test
-
-# 3. global model p(N, R | E, type) — all 9 species, ~5 min on one A100
-#    --max-points must match the point-cloud cache, or R means two different
-#    things in the two models (see "Matching the truncation" below)
-$PY scripts/preprocess_globals.py \
-    --input /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/lar_muon_voxels.h5 \
-    --output /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_globals_maxp8192.h5 \
-    --max-points 8192
-sbatch scripts/train_global_perlmutter.sh results/global_all_species_v5
-
-# 4. generation — conditions on the validation tail of the cache
-$PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source truth
-$PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source empirical
-# v3: take N and R from the global model, and enforce R by rescaling
-$PY -m lardiff.generator results/<run> <cache.h5> -n 2000 --n-source global \
-    --global-model results/global_all_species_v5 --pdg 11 --renormalize
-
-# 5. validation plots -> results/<run>/eval_samplesNN/
-$PY -m lardiff.evaluate results/<run>/samples00.h5 <cache.h5>
+CACHE=/global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache
+RAW=/global/cfs/cdirs/m2612/ozamram/LAR_Diffu/lar_muon_voxels.h5
 ```
 
-Multi-GPU: `torchrun --standalone --nproc_per_node=4 lardiff/train.py
-conf/lar_muon.yaml --ddp` (global batch size is divided across ranks).
+All caches below already exist; the preprocessing commands are here so they can
+be rebuilt, not because you need to run them.
 
-Evaluation plots: hit multiplicity, total deposited energy,
-E_dep/E_inc response (both a histogram, with mean ± std in the legend, and a
-profile vs. incident energy), per-voxel energy spectrum, hit position
-distributions, per-axis event extents and energy-weighted centroids,
-per-axis energy profiles (mean deposited energy per event, and mean hit
-energy, vs. x/y/z), and side-by-side truth/model event displays.
+### Generate and evaluate from an existing model
+
+This is what most people want. Nothing needs training.
+
+```bash
+# electrons: 5000 events, N and R from the global model, totals enforced
+# (~60 min on one A100 -- generation is the slow step, not training)
+$PY -m lardiff.generator \
+    results/20260818_121435_LAr-electron-CNF-v4-cont $CACHE/lar_pdg11_maxp8192.h5 \
+    -n 5000 --n-source global --global-model results/global_all_species_v5 \
+    --renormalize --solver heun --num-timesteps 200 --seed 0
+
+# muons (this model predates the global model, so it takes N from a bootstrap)
+$PY -m lardiff.generator \
+    results/20260810_154350_LAr-muon-CNF $CACHE/lar_pdg13_maxp4096.h5 \
+    -n 2000 --n-source empirical --solver heun --num-timesteps 200
+
+# plots -> results/<run>/eval_samplesNN/
+$PY -m lardiff.evaluate results/<run>/samples00.h5 $CACHE/lar_pdg11_maxp8192.h5
+```
+
+Samples land in `results/<run>/samplesNN.h5` with the next free `NN`, and the
+arguments used are written beside them as `samplesNN.yaml`.
+
+`--n-source` picks where the hit count `N` and response `R` come from:
+
+| value | meaning |
+|---|---|
+| `truth` | from the held-out event itself — for one-to-one comparison |
+| `empirical` | bootstrap of `P(N \| E)` over the training split |
+| `global` | from a trained global model; needs `--global-model` |
+
+`--renormalize` rescales each event's hits so its total matches the drawn `R`
+exactly. **You almost always want it** — see *Does renormalization help?* below.
+It is not yet the default.
+
+### Generate from the all-species model
+
+Same command, pointed at the packed cache. The generator reads the species from
+the cache and feeds the point model's particle embedding, so no extra flag is
+needed; `--pdg` is only for forcing a species on a single-species cache.
+
+```bash
+$PY -m lardiff.generator \
+    results/<allspecies_run> $CACHE/lar_all_species_maxp8192.h5 \
+    -n 5000 --n-source global --global-model results/global_all_species_v5 \
+    --renormalize --solver heun --num-timesteps 200
+
+# evaluate all species together, or one at a time
+$PY -m lardiff.evaluate results/<run>/samples00.h5 $CACHE/lar_all_species_maxp8192.h5
+$PY -m lardiff.evaluate results/<run>/samples00.h5 $CACHE/lar_all_species_maxp8192.h5 \
+    --pdg 11 --out results/<run>/eval_electrons
+```
+
+Generation always draws from the **end** of the cache, which for the packed
+cache is inside the held-out test region, so it never touches training events.
+
+### Training
+
+```bash
+# single GPU, resumes results/*_<run_name>/checkpoints/last.pt if it exists
+sbatch scripts/train_resume_perlmutter.sh conf/lar_electron_v4.yaml
+
+# four GPUs, same resume behaviour (batch_size in the conf is the GLOBAL batch)
+sbatch scripts/train_ddp_perlmutter.sh conf/lar_allspecies_v6.yaml
+
+# a run longer than the 24 h queue limit: chain jobs, each resuming the last
+J=$(sbatch --parsable scripts/train_ddp_perlmutter.sh conf/lar_allspecies_v6.yaml)
+for i in 1 2 3 4; do
+    J=$(sbatch --parsable --dependency=afterany:$J \
+        scripts/train_ddp_perlmutter.sh conf/lar_allspecies_v6.yaml)
+done
+
+# interactively, and a 2-epoch smoke test that writes to results/test
+$PY lardiff/train.py conf/lar_electron_v4.yaml
+$PY lardiff/train.py conf/lar_allspecies_v6.yaml --fast-dev-run
+torchrun --standalone --nproc_per_node=4 lardiff/train.py conf/... --ddp
+```
+
+Progress: `results/<run>/data/losses.txt` is two columns, train and validation,
+one row per finished epoch. `results/<run>/plots/losses.pdf` is the same thing
+drawn. Weights are `weights/best.pt` (argmin validation) and `weights/final.pt`
+(last epoch); with the deterministic validation loss these are usually the same
+file, because the loss no longer bounces around its own noise.
+
+**Continuing a finished run: use `train.init_weights`, not a bigger
+`num_epochs`.** `CosineAnnealingLR.state_dict()` carries `T_max`, so resuming
+restores the *old* horizon, and the cosine — periodic in `last_epoch` — walks
+back *up* past its minimum. `init_weights` takes only the weights, so the new
+run gets its own warmup and its own decay to zero. See
+`conf/lar_electron_v4_cont.yaml`. It applies only when no checkpoint exists, so
+a preempted warm-started run still resumes normally.
+
+### Rebuilding the caches
+
+```bash
+# one species, dense padded  (a few minutes)
+$PY scripts/preprocess_lar.py --input $RAW \
+    --output $CACHE/lar_pdg11_maxp8192.h5 --pdg 11 --max-points 8192
+
+# all nine species, packed  (~7 min, 25 GB)
+$PY scripts/preprocess_lar_all.py --input $RAW \
+    --output $CACHE/lar_all_species_maxp8192.h5 --max-points 8192
+
+# globals for p(N, R | E, type).  --max-points MUST match the point cache or
+# R means two different things in the two models; see "Matching the truncation"
+$PY scripts/preprocess_globals.py --input $RAW \
+    --output $CACHE/lar_globals_maxp8192.h5 --max-points 8192
+sbatch scripts/train_global_perlmutter.sh results/global_all_species_v5
+```
+
+### Gotchas
+
+- **`val_len` should be a multiple of the batch size.** A ragged last batch
+  changes the `BlockMask` shape and triggers a recompile every epoch.
+- **Generated coordinates are continuous, not on the 5 mm grid.** If you snap
+  them, merge duplicates and sum their energies — about 5% of electron hits
+  collide. See *Generated coordinates are continuous* below.
+- **Generation is the expensive step**, roughly 60 min per 5000 electron events
+  at 200 Heun steps on one A100. Training a model costs less than generating a
+  decent sample from it.
 
 ## v1 results (muons, 100 epochs, ~1.3M parameters)
 
@@ -466,6 +602,130 @@ paired with; muons are the only species where the caps differ materially (0.4%
 exceed 4096 against 0.01% exceeding 8192) and they carry no containment atom, so
 a single 8192 file serves every cache in use.
 
+## v4: deposited-energy conditioning, and v4-cont
+
+`conf/lar_electron_v4.yaml` is v3 with the two fixes described above — the third
+conditioning channel carrying `E_dep` instead of `R`, and the deterministic
+validation loss. `conf/lar_electron_v4_cont.yaml` warm-starts from it and runs
+80 more epochs, because v4 was still improving when its 40-epoch cosine ran out.
+
+| run | best val | best epoch | validation noise floor* |
+|---|---|---|---|
+| v2 | 0.27064 | 39 | 0.00143 |
+| v3 | 0.27070 | 28 | 0.00143 |
+| v4 | 0.27040 | 40 | 0.00013 |
+| **v4-cont** | **0.270122** | **80** | **0.000009** |
+
+\* std of the residual to the running minimum over the last 20 epochs.
+
+The deterministic validation loss cut that noise by ~11x at v4 and another ~14x
+once the schedule had flattened. Both v4 and v4-cont have their argmin on the
+last epoch, so `best.pt` and `final.pt` are bit-identical — which is what a
+converged run under a cosine decaying to zero should look like. The last two
+epochs of v4-cont moved the loss by 1e-8.
+
+The warm restart is slower than it looks: at a peak LR 30% of the original it
+took until **epoch 46** to get back below v4's 0.27040. Budget for that if you
+continue a run this way.
+
+### What the extra training bought
+
+5000 held-out electrons, same seed and same global-v5 `N` and `R` in both arms,
+so multiplicity and response are identical by construction and every difference
+is the point model. Two-sample KS, 5% critical value ~0.027.
+
+| observable | v4 | v4-cont |
+|---|---|---|
+| centroid x / y / z | 0.0224 / 0.0284 / 0.0168 | **0.0156** / **0.0176** / 0.0228 |
+| extent x / y / z | 0.0202 / 0.0202 / 0.0292 | **0.0122** / **0.0168** / **0.0218** |
+| rms x / y / z | 0.0212 / 0.0316 / 0.0150 | 0.0220 / **0.0198** / **0.0136** |
+| hit x / y / z | 0.0383 / 0.0384 / 0.0040 | **0.0354** / **0.0368** / 0.0070 |
+| hit edep | 0.0335 | **0.0328** |
+
+Most shape observables improved; `centroid_z` and `hit_z` regressed. The
+per-hit spectrum is within 0.5–2.6% of Geant4 at every percentile from p1 to
+p99.9 in both.
+
+### The per-voxel spectrum has discrete lines
+
+Geant4's per-voxel energy spectrum is **not continuous**. About 6.8% of all
+deposits sit on a handful of discrete energies set by the transport physics:
+
+| line | Geant4 | v4 | v4-cont |
+|---|---|---|---|
+| 3.2063 keV | 6.30% | 1.89% | **3.04%** |
+| 326.5 eV | 0.484% | 0.112% | **0.185%** |
+| 29.24 eV | 0.055% | 0.002% | **0.008%** |
+| 511 keV | 0.226% | 0.225% | 0.216% |
+
+Away from the lines the CDF agrees within 0.2% at every decade boundary from
+1e-7 to 10 MeV, so essentially the whole 0.033 hit-level KS is concentrated at
+3.2 keV.
+
+This is the same *shape* of problem as the containment atom in `R` and the
+truncation atom in `N` — a continuous density asked to put mass on a point —
+but unlike those two it is **not** clearly a hard limit. Training alone moved
+the 3.2 keV fraction up 60%, from 1.89% to 3.04%: a continuous density cannot
+place a true atom, but it can concentrate arbitrarily sharply, and more capacity
+or more epochs evidently keeps buying that. Worth another look before anyone
+builds a mixture model to handle it. The 511 keV annihilation line, notably, is
+already reproduced almost exactly.
+
+## v6: one model for all nine species
+
+`conf/lar_allspecies_v6.yaml`. The point model gains a particle-type embedding
+and trains on all nine primaries at once, against the per-species models
+everywhere above.
+
+Type enters as `nn.Embedding(9, dim_embedding)` added as a global token, exactly
+like the conditioning token. This is arithmetically a one-hot times a weight
+matrix, but it keeps a categorical code out of the `Log` -> `StandardScaler`
+chain the continuous conditioning channels go through, where it would mean
+nothing.
+
+**Status: training.** 100 epochs, four A100s, ~3.5 days across chained jobs.
+Results go here when it finishes.
+
+### Out-of-core data: the packed cache
+
+The dense caches are read into RAM whole, which all nine species cannot be: one
+million events padded to 8192 points is **131 GB**. `preprocess_lar_all.py`
+stores the hits packed with CSR offsets instead — **25 GB** — and
+`lar_data.H5DataSet` pads each batch as it reads it.
+
+Reading it naively is a trap worth knowing about. A fully shuffled index means
+every batch is a scatter of single-event reads, and on CFS a scattered read
+costs **~52 ms per event** against **~0.02 ms** when the same bytes arrive in
+one request — 1486 ms to assemble a batch of 64, comparable to the training step
+it is meant to be feeding. `PackedLoader` therefore reads `block_events`
+consecutive events in one call and shuffles within that buffer, shuffling block
+order too: **85 ms per batch**, a 17x speedup, ~6% overhead on the step.
+
+That is only legitimate because the cache's physical order is already random.
+It is: physical index correlates with log-energy, species and log-multiplicity
+at r ~ 5e-4, and every 100k-event slab is uniform in species and mean log-E.
+`preprocess_lar_all.py` keeps raw-file order rather than shuffling on disk,
+which is what makes both the read and the write sequential; it stores a `perm`
+dataset for anyone who wants a different ordering.
+
+### Train / validation / test split
+
+The dense path keeps a validation tail and nothing else. The packed path takes
+`data.holdout_frac` (0.3 in the v6 config) out of training entirely:
+
+| region | events | used for |
+|---|---|---|
+| train | 700,000 | training |
+| validation | 10,240 | the per-epoch loss |
+| test | 289,760 | never read during training |
+
+Validation monitors only the first `val_len` events *of* the holdout — scoring
+all 300k every epoch would cost a large fraction of an epoch — so the remaining
+290k are clean for generation and evaluation. All three regions are
+species-balanced to ~11.1% each, which falls out of the physical order being
+random. Generation draws from the end of the cache, so it lands in the test
+region by construction.
+
 ## torch 2.5 notes
 
 The pinned environment (torch 2.5.1+cu121) has three flex-attention pitfalls
@@ -483,22 +743,30 @@ this repo works around; all disappear with torch ≥ 2.6:
 
 ## Next steps
 
-- Make `--renormalize` the default for generation, and generate
-  v2 + global-model `R` + `--renormalize` to confirm it — that combination is
-  the best on the numbers above but has not been run (the v2 model takes no `R`
-  token, so the two halves are independent and the existing
-  `--n-source global --renormalize` path should just work).
-- Retrain the electron v3 model with the deposited-energy conditioning channel
-  and the deterministic validation loss, then re-judge whether conditioning
-  earns its place. The previous verdict was confounded on both counts.
-- Optional grid snapping with duplicate merging in `generator.py`, for
-  consumers that need true voxel output.
+Roughly in order of value.
+
+- **Regenerate the muon samples through the current pipeline.** The muon plots
+  in the writeup come from the v1 setup — `[E, N]` conditioning, no global
+  model, no renormalization, 4096-point cap — so they are not comparable to the
+  electron ones sitting beside them. About 25 min of GPU time.
+- **Make `--renormalize` the default.** It is required for the response to come
+  out right and there is no case where you want it off; leaving it opt-in is a
+  trap for anyone reading the CLI rather than this file.
+- Finish v6 and compare per-species against the single-species models: what is
+  lost by sharing weights, and what the rarer species gain.
+- Fix the global model's containment classifier at the 3728-6105 MeV turn-on.
+  Geant4 escapes 0.7865 of the time there, the model 0.6947 — a 14 sigma miss,
+  and by far the worst bin. It sits where the escape rate climbs steepest and
+  where the training set thins to ~3900 events per bin against 21000 lower
+  down. Every other energy bin agrees to ~0.01.
+- Revisit the discrete voxel-energy lines now that more training is known to
+  move them; decide whether a mixture is needed or whether capacity is enough.
+- Fewer ODE steps at generation, or distillation. Generation dominates the cost
+  of using this thing: ~60 min per 5000 electron events against ~47 h to train
+  the model.
+- Optional grid snapping with duplicate merging in `generator.py`.
 - Tighten the global model's mu- peak placement if it matters downstream (a
   5-minute retrain); see the v3 results above for why the KS overstates it.
-- Fewer ODE steps at generation (200 Heun steps ≈ 25 s per 128-event batch at
-  4096 points, ~125 s at 8192); distillation or a timestep study. This is now
-  the main cost: generating 2000 electron events takes ~33 min.
-- Condition on initial particle direction; extend to the other 8 species in
-  the dataset via the (already present, disabled) particle embedding.
-- Per-event loss normalization and OT noise–data matching (upstream
+- Condition on initial particle direction.
+- Per-event loss normalization and OT noise-data matching (upstream
   `OT_match.py`) for training-efficiency studies.

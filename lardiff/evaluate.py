@@ -217,11 +217,40 @@ def plot_event_displays(
     plt.close()
 
 
+def read_truth_points(cache_file: str, first: int, last: int, max_points: int):
+    """Padded truth points for events [first, last), from either cache layout.
+
+    The single-species caches store a dense padded `points` array; the
+    multi-species ones store hits packed with CSR offsets and no padded array,
+    so those have to be scattered back out here.  Hits are ordered by
+    descending energy, so keeping the first `max_points` reproduces the
+    truncation the model was trained under.
+    """
+    with h5py.File(cache_file, "r") as f:
+        if "points" in f:
+            return f["points"][first:last]
+        offsets = f["offsets"][first : last + 1].astype(np.int64)
+        flat = f["hits"][int(offsets[0]) : int(offsets[-1])]
+    base = offsets - offsets[0]
+    n = np.minimum(np.diff(offsets), max_points)
+    points = np.zeros((last - first, max_points, 4), dtype=np.float32)
+    col = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+    points[np.repeat(np.arange(last - first), n), col] = flat[
+        np.repeat(base[:-1], n) + col
+    ]
+    return points
+
+
 def main(args: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("samples_file", help="generated samples h5")
     parser.add_argument("cache_file", help="preprocessed cache h5 with the truth")
     parser.add_argument("--out", default=None, help="output directory for plots")
+    parser.add_argument(
+        "--pdg", type=int, default=None,
+        help="restrict to one species; only for samples from a multi-species "
+             "run, which record a PDG code per event",
+    )
     parsed = parser.parse_args(args)
 
     out_dir = parsed.out or os.path.join(
@@ -235,9 +264,29 @@ def main(args: list[str] | None = None) -> None:
         gen_points = f["points"][:]
         e_inc = f["energy_MeV"][:]
         cache_index = f["cache_index"][:]
-    with h5py.File(parsed.cache_file, "r") as f:
-        g4_points = f["points"][cache_index[0] : cache_index[-1] + 1]
+        pdg = f["pdg"][:] if "pdg" in f else None
+    g4_points = read_truth_points(
+        parsed.cache_file,
+        int(cache_index[0]),
+        int(cache_index[-1]) + 1,
+        gen_points.shape[1],
+    )
     assert len(g4_points) == len(gen_points)
+
+    if parsed.pdg is not None:
+        if pdg is None:
+            raise SystemExit(
+                "--pdg needs samples that record a species per event; this "
+                "file predates that and is single-species anyway"
+            )
+        keep = pdg == parsed.pdg
+        if not keep.any():
+            raise SystemExit(
+                f"no events with pdg {parsed.pdg}; file has "
+                f"{sorted(set(pdg.tolist()))}"
+            )
+        print(f"pdg {parsed.pdg}: {keep.sum()} of {len(keep)} events")
+        gen_points, g4_points, e_inc = gen_points[keep], g4_points[keep], e_inc[keep]
 
     gen_obs = event_observables(gen_points)
     g4_obs = event_observables(g4_points)

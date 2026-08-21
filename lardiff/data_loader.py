@@ -12,6 +12,9 @@ class ModelInputDict(TypedDict):
     cond: torch.Tensor
     mask: torch.Tensor
     noise: torch.Tensor | None
+    # species index for multi-species runs; None when a run is single-species,
+    # in which case Transformer.forward ignores it
+    label: torch.Tensor | None
 
 
 class DataSet(ABC):

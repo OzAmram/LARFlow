@@ -46,6 +46,9 @@ class LArGenerator(nn.Module):
 
         # v1/v2 runs condition on [E, N]; v3 adds the energy ratio
         self.cond_dim = run_params["model"]["dim_inputs"][2]
+        # >1 means the run was trained on several species and its particle
+        # embedding has to be fed, or every species decodes as an average
+        self.num_particles = run_params["model"].get("num_particles", 1)
         self.__init_model(run_params["model"], state_dict_file, solver=solver)
         self.__init_trafo(run_params["data"], trafo_file)
         self.to(torch.get_default_dtype())
@@ -106,7 +109,13 @@ class LArGenerator(nn.Module):
         num_points: Tensor,
         ratio: Tensor | None = None,
         renormalize: bool = False,
+        label: Tensor | None = None,
     ) -> Tensor:
+        if self.num_particles > 1 and label is None:
+            raise ValueError(
+                f"this run was trained on {self.num_particles} species and "
+                "conditions on particle type; supply `label`"
+            )
         num_points = num_points.clamp(min=1, max=self.max_points)
         device = energies.device
         mask = (
@@ -133,6 +142,7 @@ class LArGenerator(nn.Module):
             num_timesteps=self.num_timesteps,
             cond=condition,
             mask=mask,
+            label=None if label is None else label.to(device),
         )
         samples = torch.zeros_like(raw_samples)
         samples[:, :, :3] = self.samples_coordinate_trafo.inverse(raw_samples[:, :, :3])
@@ -214,6 +224,26 @@ def print_time(text):
     sys.stdout.flush()
 
 
+def packed_edep(f, first: int, last: int, max_points: int) -> np.ndarray:
+    """Deposited energy per event for a packed cache, matching truncation.
+
+    The packed caches store hits end to end with CSR offsets and no padded
+    `points` array, so the per-event sum has to be taken over the offsets.
+    Hits are ordered by descending energy, so summing the first
+    `max_points` of each event reproduces what the point model is trained on.
+    """
+    offsets = f["offsets"][first : last + 1].astype(np.int64)
+    edep = f["hits"][int(offsets[0]) : int(offsets[-1]), 3]
+    base = offsets - offsets[0]
+    n = np.minimum(np.diff(offsets), max_points)
+    keep = np.repeat(base[:-1], n) + (
+        np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+    )
+    out = np.zeros(last - first, dtype=np.float64)
+    np.add.at(out, np.repeat(np.arange(last - first), n), edep[keep])
+    return out
+
+
 def generate(
     generator: LArGenerator,
     energies: Tensor,
@@ -222,6 +252,7 @@ def generate(
     device: str | torch.device = "cpu",
     ratios: Tensor | None = None,
     renormalize: bool = False,
+    labels: Tensor | None = None,
 ) -> Tensor:
     if batch_size is None:
         batch_size = energies.shape[0]
@@ -231,12 +262,16 @@ def generate(
         split_ratios: tuple = (None,) * len(split_energies)
     else:
         split_ratios = torch.split(ratios, batch_size, dim=0)
+    if labels is None:
+        split_labels: tuple = (None,) * len(split_energies)
+    else:
+        split_labels = torch.split(labels, batch_size, dim=0)
 
     generator = generator.to(device)
     generator.eval()
     samples = []
-    for i, (energies_l, num_points_l, ratios_l) in enumerate(
-        zip(split_energies, split_num_points, split_ratios)
+    for i, (energies_l, num_points_l, ratios_l, labels_l) in enumerate(
+        zip(split_energies, split_num_points, split_ratios, split_labels)
     ):
         print_time(f"start batch {i:3d}")
         samples_l = generator(
@@ -244,6 +279,7 @@ def generate(
             num_points_l.to(device),
             ratio=None if ratios_l is None else ratios_l.to(device),
             renormalize=renormalize,
+            label=None if labels_l is None else labels_l.to(device),
         ).cpu()
         samples.append(samples_l)
     samples = torch.cat(samples)
@@ -353,12 +389,23 @@ def main(args: list[str] | None = None) -> None:
         energies = f["energy_MeV"][first:]
         n_truth = f["n_points"][first:].astype(np.int64)
         cache_index = np.arange(first, data_len, dtype=np.int64)
+        packed = "hits" in f
         # truth ratio of the held-out events, from the same (possibly
         # truncated) points the model is trained to reproduce
         r_truth = (
-            f["points"][first:, :, 3].sum(axis=1) / energies
-        ).astype(np.float64)
-        pdg = parsed_args.pdg or int(f.attrs.get("pdg", 0))
+            packed_edep(f, first, data_len, generator.max_points)
+            if packed
+            else f["points"][first:, :, 3].sum(axis=1)
+        ).astype(np.float64) / energies
+        # a multi-species cache carries one code per event; a single-species
+        # one carries it as a file attribute
+        if packed:
+            pdg_per_event = f["pdg"][first:].astype(np.int64)
+            species = np.asarray(f.attrs["species"], dtype=np.int64)
+        else:
+            pdg = parsed_args.pdg or int(f.attrs.get("pdg", 0))
+            pdg_per_event = np.full(len(energies), pdg, dtype=np.int64)
+            species = np.array([pdg], dtype=np.int64)
         if parsed_args.n_source == "empirical":
             with open(os.path.join(parsed_args.run_dir, "conf.yaml")) as cf:
                 run_conf = yaml.safe_load(cf)
@@ -368,9 +415,10 @@ def main(args: list[str] | None = None) -> None:
             train_ratio = None
             if needs_ratio:
                 train_ratio = (
-                    f["points"][:train_stop, :, 3].sum(axis=1)
-                    / f["energy_MeV"][:train_stop]
-                )
+                    packed_edep(f, 0, train_stop, generator.max_points)
+                    if packed
+                    else f["points"][:train_stop, :, 3].sum(axis=1)
+                ) / f["energy_MeV"][:train_stop]
             n_sampler.fit(
                 f["energy_MeV"][:train_stop],
                 f["n_points"][:train_stop],
@@ -384,17 +432,32 @@ def main(args: list[str] | None = None) -> None:
             from lardiff.global_model import GlobalSampler
 
             sampler = GlobalSampler(parsed_args.global_model, device=device)
-            n_t, r_t = sampler.sample(
-                torch.from_numpy(energies.astype(np.float32)),
-                pdg=pdg,
-                max_num_points=generator.max_points,
-            )
-            n_used, r_used = n_t.numpy(), r_t.numpy().astype(np.float64)
+            n_used = np.empty(len(energies), dtype=np.int64)
+            r_used = np.empty(len(energies), dtype=np.float64)
+            for code in np.unique(pdg_per_event):
+                sel = pdg_per_event == code
+                n_t, r_t = sampler.sample(
+                    torch.from_numpy(energies[sel].astype(np.float32)),
+                    pdg=int(code),
+                    max_num_points=generator.max_points,
+                )
+                n_used[sel] = n_t.numpy()
+                r_used[sel] = r_t.numpy().astype(np.float64)
         else:
             n_used, r_used = n_truth.copy(), r_truth.copy()
     n_used = np.minimum(n_used, generator.max_points)
     if needs_ratio and not np.isfinite(r_used).all():
         raise ValueError("non-finite energy ratios; is the cache missing points?")
+
+    labels = None
+    if generator.num_particles > 1:
+        if len(species) < generator.num_particles:
+            raise ValueError(
+                f"the model conditions on {generator.num_particles} species "
+                f"but the cache describes {len(species)}; generate from the "
+                "cache the model was trained on"
+            )
+        labels = torch.from_numpy(np.searchsorted(species, pdg_per_event))
 
     samples = generate(
         generator,
@@ -406,6 +469,7 @@ def main(args: list[str] | None = None) -> None:
             torch.from_numpy(r_used.astype(np.float32)) if needs_ratio else None
         ),
         renormalize=parsed_args.renormalize,
+        labels=labels,
     )
 
     for i in range(100):
@@ -424,6 +488,7 @@ def main(args: list[str] | None = None) -> None:
         f.create_dataset("ratio_used", data=r_used)
         f.create_dataset("ratio_truth", data=r_truth)
         f.create_dataset("cache_index", data=cache_index)
+        f.create_dataset("pdg", data=pdg_per_event)
         f.attrs["cache_file"] = parsed_args.cache_file
         f.attrs["renormalized"] = parsed_args.renormalize
     with open(os.path.join(parsed_args.run_dir, name + ".yaml"), "w") as f:
