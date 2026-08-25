@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-results/
+results
+results.local.bak/
 *.h5
 *.egg-info/
 slurm-*.out

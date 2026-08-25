@@ -27,40 +27,48 @@ in [results.md](results.md).
 
 The global model covers all nine species and pairs with any point model.
 
-## Shared copy on CFS
+## Shared storage
 
-Home directories are not group-readable on NERSC and cannot be made so without
-exposing the whole home, so everything a collaborator needs lives under the
-project directory instead, group `m2612`, group-readable:
+Home directories are not group-readable on NERSC and should not be made so, so
+everything lives under the project directory, group `m2612`, group-readable:
 
 ```
 /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/
   lar_muon_voxels.h5    # raw ToyG4 events
   cache/                # preprocessed caches
-  results/              # trained models, configs, transforms, plots
+  results/              # trained models, configs, transforms, samples, plots
 ```
 
-Point the commands below at `$SHARED/results/<run>` instead of `results/<run>`:
+`results/` in this checkout is a **symlink** to that directory, so training,
+generation and evaluation all write straight to the shared area — there is no
+copy step and nothing to keep in sync. Directories carry the setgid bit and the
+default umask is `0007`, so new files land in group `m2612` automatically.
+
+The symlink is not in git, since it points at an absolute path. Recreate it
+after a fresh clone:
+
+```bash
+ln -s /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/results results
+```
+
+Two things to be careful of:
+
+- **Never `rsync -a` over `results/`.** `-a` implies `-p`, which copies the
+  source's permissions and strips the setgid bits; new files then revert to the
+  personal group and become unreadable to everyone else. Use `-rlt` if you ever
+  do need to copy in.
+- **`result_path` inside older `conf.yaml` files points at the pre-symlink home
+  path.** Generation and evaluation ignore it — they resolve everything relative
+  to the run directory you pass — but resuming training from such a run would
+  write to the old location.
+
+If permissions ever look wrong, this restores them:
 
 ```bash
 SHARED=/global/cfs/cdirs/m2612/ozamram/LAR_Diffu
+chgrp -R m2612 $SHARED && chmod -R g+rX $SHARED
+find $SHARED -type d -exec chmod g+s {} +
 ```
-
-Two things to know about that copy:
-
-- **It is a snapshot, not a live mirror.** Training writes to the home checkout,
-  so re-sync after a run finishes:
-  `rsync -a results/ $SHARED/results/ && chgrp -R m2612 $SHARED/results && chmod -R g+rX $SHARED/results`
-- **`result_path` inside each copied `conf.yaml` still points at the home
-  checkout.** Generation and evaluation ignore it — they resolve everything
-  relative to the run directory you pass — but *resuming training* from the CFS
-  copy would try to write back to the home path and fail. Resume from the home
-  checkout, or edit `result_path` first.
-
-Directories carry the setgid bit, so files created there inherit `m2612` rather
-than the personal group. That is what was wrong originally: the project
-subdirectory was group `ozamram`, so nothing under it was reachable by the
-project group even though the mode bits looked permissive.
 
 ## Layout
 
