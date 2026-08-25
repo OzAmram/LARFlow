@@ -161,7 +161,33 @@ trained global model; needs `--global-model`).
 exactly. **You almost always want it**; it is not yet the default.
 
 Generation draws from the **end** of the cache, which for the packed cache is
-inside the held-out test region.
+inside the held-out test region. `-n` is a slice of the cache, **not a
+per-species count**: the packed cache is species-balanced at ~11.1%, so `-n
+90000` gives about 10k of each of the nine species.
+
+### Large samples: generate in parallel chunks
+
+At ~0.6 s/event a 90k-event sample is 15 h in one process, and the generator
+holds the whole thing in memory and writes once at the end, so a timeout loses
+all of it. `--start` takes an absolute cache index and `--out` names the output,
+which together let chunks run as a job array and be stitched back together:
+
+```bash
+# 9 x 10k events in parallel (~1.7 h each), then merge and evaluate per species
+sbatch scripts/generate_v6_array_perlmutter.sh
+sbatch --dependency=afterany:<array jobid> scripts/eval_v6_perlmutter.sh
+
+# or by hand
+$PY -m lardiff.generator <run> $CACHE/lar_all_species_maxp8192.h5 \
+    -n 10000 --start 910000 --out <run>/chunks/chunk_00.h5 \
+    --n-source global --global-model results/global_all_species_v5 --renormalize
+$PY scripts/merge_samples.py <run>/samples_all.h5 <run>/chunks/chunk_*.h5
+```
+
+`merge_samples.py` sorts the chunks by cache index and refuses to merge a set
+that does not tile a contiguous range, since `evaluate` reads truth as a single
+slice and a gap would misalign it. Rerun the missing array index and merge
+again.
 
 ### Evaluate
 

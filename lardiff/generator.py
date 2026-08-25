@@ -348,6 +348,19 @@ def get_args(args: list[str] | None = None) -> argparse.Namespace:
         help="rescale each event's hit energies so the total matches the "
         "conditioned ratio exactly",
     )
+    parser.add_argument(
+        "--start", type=int, default=None,
+        help="absolute index of the first cache event to condition on. "
+             "Default is the tail, data_len - num_samples.  Set it to split a "
+             "large sample across parallel jobs, which also means a job that "
+             "dies loses only its own chunk",
+    )
+    parser.add_argument(
+        "--out", default=None,
+        help="output file. Default is the next free <run_dir>/samplesNN.h5, "
+             "which races when several jobs write at once, so parallel chunks "
+             "must each name their own",
+    )
     parser.add_argument("--seed", default=0, type=int)
     return parser.parse_args(args)
 
@@ -380,27 +393,30 @@ def main(args: list[str] | None = None) -> None:
     needs_ratio = generator.cond_dim > 2 or parsed_args.renormalize
     with h5py.File(parsed_args.cache_file, "r") as f:
         data_len = f["energy_MeV"].shape[0]
-        first = data_len - parsed_args.num_samples
-        if first < 0:
+        if parsed_args.start is None:
+            first = data_len - parsed_args.num_samples
+        else:
+            first = parsed_args.start
+        last = min(first + parsed_args.num_samples, data_len)
+        if first < 0 or first >= data_len:
             raise ValueError(
-                f"requested {parsed_args.num_samples} samples but cache only "
-                f"has {data_len} events"
+                f"start {first} outside the cache, which has {data_len} events"
             )
-        energies = f["energy_MeV"][first:]
-        n_truth = f["n_points"][first:].astype(np.int64)
-        cache_index = np.arange(first, data_len, dtype=np.int64)
+        energies = f["energy_MeV"][first:last]
+        n_truth = f["n_points"][first:last].astype(np.int64)
+        cache_index = np.arange(first, last, dtype=np.int64)
         packed = "hits" in f
         # truth ratio of the held-out events, from the same (possibly
         # truncated) points the model is trained to reproduce
         r_truth = (
-            packed_edep(f, first, data_len, generator.max_points)
+            packed_edep(f, first, last, generator.max_points)
             if packed
-            else f["points"][first:, :, 3].sum(axis=1)
+            else f["points"][first:last, :, 3].sum(axis=1)
         ).astype(np.float64) / energies
         # a multi-species cache carries one code per event; a single-species
         # one carries it as a file attribute
         if packed:
-            pdg_per_event = f["pdg"][first:].astype(np.int64)
+            pdg_per_event = f["pdg"][first:last].astype(np.int64)
             species = np.asarray(f.attrs["species"], dtype=np.int64)
         else:
             pdg = parsed_args.pdg or int(f.attrs.get("pdg", 0))
@@ -472,13 +488,18 @@ def main(args: list[str] | None = None) -> None:
         labels=labels,
     )
 
-    for i in range(100):
-        name = f"samples{i:02d}"
-        file_path = os.path.join(parsed_args.run_dir, name + ".h5")
-        if not os.path.exists(file_path):
-            break
+    if parsed_args.out:
+        file_path = parsed_args.out
+        name = os.path.splitext(os.path.basename(file_path))[0]
+        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
     else:
-        raise RuntimeError("no free sample file name found")
+        for i in range(100):
+            name = f"samples{i:02d}"
+            file_path = os.path.join(parsed_args.run_dir, name + ".h5")
+            if not os.path.exists(file_path):
+                break
+        else:
+            raise RuntimeError("no free sample file name found")
 
     with h5py.File(file_path, "w") as f:
         f.create_dataset("points", data=samples.numpy())
@@ -491,7 +512,10 @@ def main(args: list[str] | None = None) -> None:
         f.create_dataset("pdg", data=pdg_per_event)
         f.attrs["cache_file"] = parsed_args.cache_file
         f.attrs["renormalized"] = parsed_args.renormalize
-    with open(os.path.join(parsed_args.run_dir, name + ".yaml"), "w") as f:
+    with open(
+        os.path.join(os.path.dirname(os.path.abspath(file_path)), name + ".yaml"),
+        "w",
+    ) as f:
         yaml.dump(vars(parsed_args), f)
 
     print(f"saved to {file_path}")
