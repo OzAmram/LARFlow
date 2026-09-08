@@ -158,6 +158,13 @@ class Trainer:
         flow = flow_matching.CNF(network, **flow_config)  # type: ignore
         flow = flow.to(self.device)
         if self.world_size > 1:
+            # DDPOptimizer buckets the Dynamo graph for overlap, and cannot
+            # handle a higher order op -- which is what flex_attention compiles
+            # to, so with torch.compile on it raises NotImplementedError before
+            # the first step.  Disabling it makes the whole graph one bucket:
+            # less gradient/communication overlap, but this model is ~1.1M
+            # parameters, so there is little to overlap.
+            torch._dynamo.config.optimize_ddp = False
             flow.network = DDP(flow.network, device_ids=[self.device.index])  # type: ignore
         self.flow = flow
 
