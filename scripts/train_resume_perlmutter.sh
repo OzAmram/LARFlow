@@ -14,7 +14,13 @@
 #SBATCH -n 1
 #SBATCH -c 32
 #SBATCH --gpus-per-task=1
-#SBATCH -t 24:00:00
+# 6 h, not the 24 h cap: on this account 24 h requests have waited a median of
+# 7.9 h to start (worst 59 h) against 1.0 h for 6 h requests, so a long run
+# finishes sooner as a chain of short jobs than as a couple of long ones.  Each
+# job resumes from checkpoints/last.pt, and one that finds training already
+# complete exits immediately, so over-provisioning the chain costs nothing.
+# Override per submission with `sbatch -t HH:MM:SS`.
+#SBATCH -t 06:00:00
 #SBATCH -J lardiff-train
 #SBATCH -o slurm-%j.out
 
