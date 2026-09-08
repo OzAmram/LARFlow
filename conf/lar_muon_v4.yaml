@@ -1,0 +1,58 @@
+# Muons through the same pipeline as the electron v4 model.
+#
+# The published muon run (LAr-muon-CNF) predates v3/v4: two conditioning
+# channels instead of three, a 4096-point cap, a non-deterministic validation
+# loss, and generation without the global model or renormalisation.  Comparing
+# its plots against the electron ones compares two different methods, so this
+# retrains muons with the electron v4 settings and nothing else changed.
+#
+# The cap is 8192 rather than the 4096 muons need on their own (0.42% of events
+# exceed 4096, 0.010% exceed 8192).  That is not about coverage: global_v5 was
+# fit with --max-points 8192, so its R is the energy in the top 8192 hits, and
+# a 4096 cache would mean a different R for the 0.41% of events between the two
+# caps.  Same cap, same quantity.
+# v4 = v3 architecture, with the two conditioning/selection fixes:
+#   - the third cond channel is now E_dep, not R (see lar_data.load_and_prepare)
+#   - the validation loss is evaluated at fixed stratified times on fixed noise,
+#     so best.pt tracks the model rather than the draw (train.val_seed)
+# Everything else is byte-identical to lar_electron_v3.yaml, so this run is
+# comparable to v2/v3 on architecture and schedule.
+run_name: LAr-muon-CNF-v4
+
+data:
+  path: /global/cfs/cdirs/m2612/ozamram/LAR_Diffu/cache/lar_pdg13_maxp8192.h5
+  max_num_points: 8192
+  val_len: 10240  # multiple of batch size, avoids BlockMask recompile on a ragged last batch
+  samples_coordinate_trafo:
+    - [StandardScaler, {shape: [1, 1, 3]}]
+  samples_energy_trafo:
+    - [Log, {alpha: 1.0e-6}]
+    - [StandardScaler, {shape: [1, 1]}]
+  cond_trafo:
+    - [Log, {alpha: 0.0}]
+    - [StandardScaler, {shape: [1, 3]}]
+
+model:
+  dim_inputs: [4, 6, 3]
+  dim_embedding: 128
+  num_head: 8
+  num_blocks: 6
+  dim_feedforward: 512
+  num_particles: 1
+  activation: GELU
+  flow_config:
+    frequencies: 3
+
+train:
+  # 100 rather than the electron v4's 40: that run had not converged when its
+  # cosine ran out and needed lar_electron_v4_cont on top, so this budgets the
+  # whole schedule up front and decays to zero once.  The v1 muon run converged
+  # in 100 epochs at batch 128; at batch 64 that is twice the steps.
+  num_epochs: 100
+  batch_size: 64
+  learning_rate: 1.e-3
+  optimizer: AdamW
+  scheduler: CosineWarmup
+  weight_decay: 1.e-2
+  grad_clip: 0.2
+  val_seed: 0

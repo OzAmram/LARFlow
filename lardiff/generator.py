@@ -224,6 +224,27 @@ def print_time(text):
     sys.stdout.flush()
 
 
+def training_upper_bound(run_dir: str, data_len: int) -> int:
+    """First cache index this run did NOT train on.
+
+    Generation conditions on real events, so it has to draw from events the
+    model never saw or the comparison against Geant4 is measuring memorisation.
+    Reproduces the split in lar_data.get_data_loaders: training is always a
+    prefix, [0, split), whether the tail is a validation set (dense caches) or
+    a validation set plus a test holdout (packed caches).
+    """
+    with open(os.path.join(run_dir, "conf.yaml")) as f:
+        conf = yaml.safe_load(f)["data"]
+    if "stop" in conf:
+        data_len = min(data_len, conf["stop"])
+    val_len = conf.get("val_len", data_len // 10)
+    holdout = conf.get("holdout_frac")
+    if holdout:
+        n_holdout = int(round(holdout * data_len))
+        return data_len - max(n_holdout, val_len)
+    return data_len - val_len
+
+
 def packed_edep(f, first: int, last: int, max_points: int) -> np.ndarray:
     """Deposited energy per event for a packed cache, matching truncation.
 
@@ -461,6 +482,17 @@ def main(args: list[str] | None = None) -> None:
                 r_used[sel] = r_t.numpy().astype(np.float64)
         else:
             n_used, r_used = n_truth.copy(), r_truth.copy()
+    held_out_from = training_upper_bound(parsed_args.run_dir, data_len)
+    if first < held_out_from:
+        raise SystemExit(
+            f"events [{first}, {last}) overlap the training region "
+            f"[0, {held_out_from}) of {parsed_args.run_dir}.\n"
+            f"Only {data_len - held_out_from} events were held out; ask for at "
+            f"most that many, or pass --start {held_out_from} or later."
+        )
+    print(f"conditioning on held-out events [{first}, {last}); this run trained "
+          f"on [0, {held_out_from})")
+
     n_used = np.minimum(n_used, generator.max_points)
     if needs_ratio and not np.isfinite(r_used).all():
         raise ValueError("non-finite energy ratios; is the cache missing points?")
