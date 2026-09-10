@@ -21,9 +21,9 @@ in [results.md](results.md).
 | purpose | run directory |
 |---|---|
 | electrons | `results/20260818_121435_LAr-electron-CNF-v4-cont` |
-| muons | `results/20260810_154350_LAr-muon-CNF` |
+| muons | `results/20260908_211332_LAr-muon-CNF-v4` |
 | `p(N, R \| E, type)`, all species | `results/global_all_species_v5` |
-| all species, type-conditioned | `results/*_LAr-allspecies-CNF-v6` (training) |
+| all species, type-conditioned | not trained; see results.md |
 
 The global model covers all nine species and pairs with any point model.
 
@@ -139,10 +139,14 @@ $PY -m lardiff.generator \
     -n 5000 --n-source global --global-model results/global_all_species_v5 \
     --renormalize --solver heun --num-timesteps 200 --seed 0
 
-# muons (predates the global model, so N comes from a bootstrap)
+# muons: same pipeline, 8192-point cache
 $PY -m lardiff.generator \
-    results/20260810_154350_LAr-muon-CNF $CACHE/lar_pdg13_maxp4096.h5 \
-    -n 2000 --n-source empirical
+    results/20260908_211332_LAr-muon-CNF-v4 $CACHE/lar_pdg13_maxp8192.h5 \
+    -n 10000 --n-source global --global-model results/global_all_species_v5 \
+    --renormalize --solver heun --num-timesteps 200 --seed 0
+
+# or generate, evaluate and score in one pass, for either species
+scripts/generate_and_eval_10k.sh <run_dir> <cache.h5>
 
 # all species: same command on the packed cache.  The species is read from the
 # cache and fed to the model's particle embedding, so no extra flag is needed

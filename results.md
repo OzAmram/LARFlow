@@ -2,21 +2,103 @@
 
 Validation of the models in [README.md](README.md), and what changed between
 versions. Two-sample KS throughout; the 5% critical value is ~0.027 at 5000
-events.
+events and ~0.019 at 10,000.
+
+**The current results are the two 10k evaluations**: electrons from
+`v4-cont` and muons from `muon-v4`, both generated through the same pipeline
+with `N` and `R` from the global model and the deposits rescaled to the drawn
+total. See *Current results* below; the version history after it records how
+each defect was found and fixed.
 
 ## Versions
 
 | | what it added | outcome |
 |---|---|---|
-| v1 | muons; the whole pipeline | works |
+| v1 | muons; the whole pipeline | works, but superseded |
 | v2 | electrons, 8192-point cache | response spread 3x too wide |
 | v3 | factorised global model `p(N, R \| E, type)` | fixes the response |
 | v4 | `E_dep` conditioning channel; deterministic validation loss | fixes both defects of v3 |
-| v4-cont | v4 warm-started, 80 more epochs | converged |
+| v4-cont | v4 warm-started, 80 more epochs | converged; the electron model |
 | v5 | global model refit to match the point cache's truncation | improves `KS(R)` for every species |
-| v6 | one point model for all 9 species, type-conditioned | training |
+| muon-v4 | muons retrained through the v4 pipeline, 8192 points | converged; the muon model |
+| v6 | one point model for all 9 species, type-conditioned | **cancelled**, see below |
 
-Everything through v5 is a per-species point model; v6 is the first joint one.
+Every model here is per-species. v6 would have been the first joint one; it was
+cancelled in favour of finishing the single-species results for a deadline, and
+never trained successfully — see *v6: what happened*.
+
+## Current results
+
+Both species, 10,000 held-out events each, evaluated identically.
+
+### One-dimensional (KS, 5% critical value 0.019)
+
+| observable | electrons | muons |
+|---|---|---|
+| hit multiplicity `N` | 0.0053 | 0.0069 |
+| total deposited energy | 0.0018 | 0.0040 |
+| response `R` | 0.0057 | **0.0284** |
+| width x / y / z | 0.013 / 0.013 / 0.013 | 0.017 / 0.015 / 0.008 |
+| extent x / y / z | 0.008 / 0.010 / 0.014 | 0.017 / 0.013 / **0.034** |
+| hit x / y / z | 0.035 / 0.036 / 0.008 | 0.035 / 0.047 / 0.004 |
+| hit energy | **0.033** | 0.019 |
+
+Response mean/std: electrons 0.9968 ± 0.0133 against Geant4 0.9969 ± 0.0134,
+with the `R = 1` atom at 0.813 against 0.807. Muons 1.160 ± 0.479 against
+1.164 ± 0.493 — muons deposit *more* than their incident kinetic energy because
+decay products contribute, and the distribution is broad, so the KS of 0.028
+corresponds to a much smaller shift in `R` than the same number would for
+electrons.
+
+Muon `extent_z` at 0.034 is the largest event-level miss: the mean is 158 mm
+long on an 8.3 m span, and extent is a min–max statistic set by the single most
+distant deposit.
+
+### Multivariate
+
+Over twelve event-level features (log `E_inc`, `R`, log `N`, per-axis centroid,
+width and extent) — the same quantities plotted as 1D histograms.
+
+| metric | electrons | muons |
+|---|---|---|
+| classifier AUC | **0.616 ± 0.005** | **0.512** |
+| null (Geant4 vs Geant4) | 0.504 ± 0.004 | 0.502 |
+| FPD ×10⁻³ | 0.289 ± 0.071 | 0.265 ± 0.087 |
+| KPD ×10⁻³ | −0.005 ± 0.025 | 0.000 ± 0.033 |
+
+**This is the most informative result in the project.** Muons are very nearly
+indistinguishable — AUC 0.512 against a 0.502 floor. Electrons are clearly
+separable at 0.616, *despite every marginal passing its KS test*. Training the
+same classifier on each feature alone gives at most 0.518, and for most
+features something indistinguishable from 0.5. So the electron discrepancy is
+entirely in the **correlations between observables**, which is exactly what
+one-dimensional tests cannot see.
+
+The natural reading is topology. A muon is minimum-ionising and deposits along
+a track, ~640 voxels whose joint structure is largely fixed by direction and
+length. An electron cascade is ~2000 voxels with far richer correlations
+between multiplicity, containment and shape. The per-deposit spectrum agrees:
+KS 0.019 for muons against 0.033 for electrons.
+
+Run it with:
+
+```bash
+python -m lardiff.metrics <run>/samples_10k.h5 <cache.h5> --out <run>/metrics_10k.json
+```
+
+FPD and KPD are transcribed from `jetnet.evaluation` rather than imported,
+because `jetnet.evaluation` pulls energyflow, coffea and awkward at module
+scope for metrics these two functions never touch. Checked against the
+reference with those stubbed out: FPD agrees bit for bit, KPD to 3e-4 relative
+(jetnet's is njit-compiled, so float accumulation order differs), which is
+~700x smaller than KPD's own uncertainty.
+
+**FPD sample-size caveat.** jetnet's defaults are `min_samples=20000,
+max_samples=50000` and it recommends ≥50,000 events. The dense caches hold out
+only `val_len` = 10,240 per species, so batches of 2,000–10,000 are used
+instead. Absolute values are not comparable with published FPDs — only between
+the models measured here the same way. The settings are recorded in the output
+JSON.
 
 ## Point models
 
@@ -81,15 +163,50 @@ Most shape observables improved; `centroid_z` and `hit_z` regressed. The
 per-hit spectrum is within 0.5–2.6% of Geant4 at every percentile p1–p99.9 in
 both.
 
-### v6, all nine species
+### muon-v4, muons (100 epochs)
 
-Point model gains an `nn.Embedding(9, dim_embedding)` for particle type, added
-as a global token alongside the conditioning token. An embedding rather than a
-one-hot input because it is the same arithmetic but keeps a categorical code out
-of the `Log` -> `StandardScaler` chain the continuous channels go through, where
-it would mean nothing.
+The v1 muon model predated the global model, the renormalisation step and the
+`E_dep` conditioning channel, so its numbers were not comparable to the electron
+ones sitting beside them. `conf/lar_muon_v4.yaml` retrains muons through the
+current pipeline at 8192 points.
 
-**Training.** 100 epochs, four A100s, ~3.5 days. Results here when it finishes.
+Converged cleanly: best val **0.065976** at epoch 99 of 100, with the last five
+epoch-to-epoch deltas at ~1e-7 against a noise floor of 1.1e-6. 412 s/epoch,
+~11.4 h of compute. `best.pt` and `final.pt` differ only because the argmin
+landed on epoch 99; the gap is 1.1e-7, inside the noise.
+
+Truncation barely touches muons: 0.01% of events exceed 8192 points against
+5.8% for electrons.
+
+### v6, all nine species: what happened
+
+Cancelled, and worth recording because it cost several days of queue time
+without producing a model.
+
+The code works — `preprocess_lar_all.py`, the packed cache, `H5DataSet`,
+`PackedLoader` and the type embedding are all committed and tested, and a
+4-rank smoke test trains. What killed it was two multi-GPU failures in a row,
+each of which a single-rank test passed straight through:
+
+1. **`torchrun` has a stale shebang.** The console script's interpreter path is
+   the one the environment was *built* with (`/workspace/envs/ml/bin/python3.11`),
+   which does not exist here, so every job died in 5 seconds. Fixed by invoking
+   `python -m torch.distributed.run` instead. Note `sbatch` snapshots the batch
+   script at submission, so fixing the file did **not** reach jobs already
+   queued — the whole chain had to be resubmitted.
+2. **DDPOptimizer cannot compile `flex_attention`.** It raises
+   `NotImplementedError: Found a higher order op in the graph` before the first
+   step. Fixed with `torch._dynamo.config.optimize_ddp = False`, which makes the
+   graph one bucket — negligible here at ~1.1M parameters.
+
+Both only bite when `world_size > 1`, and `--fast-dev-run --ddp` with
+`--nproc_per_node=1` never wraps the model in DDP at all. **Test multi-GPU
+paths with at least 2 ranks on real devices**, which on this system means a
+GPU-node job, since two ranks on one login-node GPU fail in NCCL.
+
+The chain was then cancelled in favour of the single-species results. To
+restart: `sbatch scripts/train_ddp_perlmutter.sh conf/lar_allspecies_v6.yaml`,
+chained, ~3.5 days.
 
 ## The global model
 
@@ -297,6 +414,10 @@ on a handful of discrete energies set by the transport physics:
 Away from the lines the CDF agrees within 0.2% at every decade boundary from
 1e-7 to 10 MeV, so essentially the whole 0.033 hit-level KS sits at 3.2 keV.
 
+Muons corroborate this: their per-deposit KS is 0.019 against the electrons'
+0.033, and muon deposits are dominated by continuous ionisation rather than the
+soft shower secondaries that populate the 3.2 keV line.
+
 This is the same shape of problem as the containment atom in `R` and the
 truncation atom in `N`, but unlike those it is **not** clearly a hard limit:
 training alone moved the 3.2 keV fraction up 60%. A continuous density cannot
@@ -338,19 +459,25 @@ rest stays clean for evaluation.
 
 Roughly in order of value.
 
-- **Regenerate the muon samples through the current pipeline.** The muon plots
-  come from the v1 setup — `[E, N]` conditioning, no global model, no
-  renormalization, 4096-point cap — so they are not comparable to the electron
-  ones. ~25 min of GPU time.
+- **Time the Geant4 application.** Generation costs ~0.6 s/event at 200 Heun
+  steps on one A100, but there is no measured Geant4 time for the same events,
+  so no speed-up factor can be quoted. A surrogate paper is expected to make
+  that comparison, and it is the one number the writeup is still missing.
+- **Close the electron correlation gap.** Classifier AUC 0.616 with every
+  marginal passing is the clearest quantitative target: the model places each
+  observable correctly and their joint structure imperfectly. Worth asking the
+  classifier *which pairs* it uses.
 - **Make `--renormalize` the default.** There is no case where you want it off.
-- Finish v6 and compare per-species against the single-species models.
-- Fix the global model's containment classifier at the 3728–6105 MeV turn-on.
 - Revisit the discrete voxel-energy lines now that training is known to move
   them; decide whether a mixture is needed or capacity is enough.
+- Restart v6 with the two DDP fixes in place, and compare per-species against
+  these single-species results.
+- Fix the global model's containment classifier at the 3728-6105 MeV turn-on
+  (14 sigma, the worst bin by a wide margin).
 - Fewer ODE steps at generation, or distillation. Generation dominates the cost
-  of using this: ~60 min per 5000 electron events against ~47 h to train.
+  of using this: ~1.7 h per 10k events against ~11 h to train the muon model.
+- A larger holdout. `val_len` = 10,240 caps the evaluation sample, forces FPD
+  off its standard batch sizes, and means the evaluation set is also the model
+  selection set. `holdout_frac` already exists for the packed caches.
 - Optional grid snapping with duplicate merging in `generator.py`.
-- Tighten the global model's mu- peak placement if it matters downstream.
 - Condition on initial particle direction.
-- Per-event loss normalization and OT noise-data matching for training
-  efficiency studies.
